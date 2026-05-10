@@ -1,0 +1,478 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <driver/i2c_master.h>
+#include <esp_lcd_io_i2c.h>
+#include <esp_lcd_panel_ops.h>
+#include <esp_lcd_panel_ssd1306.h>
+#include <WiFiManager.h>
+#include <algorithm>
+#include <string>
+
+#include "ai_vox_engine.h"
+#include "ai_vox_observer.h"
+#include "display.h"
+#include "i2s_std_audio_input_device.h"
+#include "i2s_std_audio_output_device.h"
+
+#ifndef ARDUINO_ESP32_DEV
+#error "This example only supports ESP32-Dev board."
+#endif
+
+// 配网状态机
+enum class WiFiConfigState {
+  IDLE,
+  CHECKING_BUTTON,
+  CONFIG_PORTAL,
+  CONNECTED
+};
+
+namespace {
+constexpr gpio_num_t kMicPinWs = GPIO_NUM_25;
+constexpr gpio_num_t kMicPinBclk = GPIO_NUM_26;
+constexpr gpio_num_t kMicPinDin = GPIO_NUM_27;
+
+constexpr gpio_num_t kSpeakerPinWs = GPIO_NUM_15;
+constexpr gpio_num_t kSpeakerPinBclk = GPIO_NUM_16;
+constexpr gpio_num_t kSpeakerPinDout = GPIO_NUM_17;
+
+constexpr gpio_num_t kI2cPinSda = GPIO_NUM_21;
+constexpr gpio_num_t kI2cPinScl = GPIO_NUM_22;
+
+constexpr gpio_num_t kTriggerPin = GPIO_NUM_35;
+constexpr gpio_num_t kLedPin = GPIO_NUM_2;
+
+// 与Arduino UNO通信的串口引脚
+constexpr gpio_num_t kUnoTxPin = GPIO_NUM_13;  // ESP32 TX -> UNO RX (引脚4)
+constexpr gpio_num_t kUnoRxPin = GPIO_NUM_14;  // ESP32 RX -> UNO TX (引脚3)
+
+constexpr uint32_t kDisplayWidth = 128;
+constexpr uint32_t kDisplayHeight = 64;
+constexpr bool kDisplayMirrorX = true;
+constexpr bool kDisplayMirrorY = true;
+
+std::unique_ptr<Display> g_display;
+auto g_observer = std::make_shared<ai_vox::Observer>();
+auto g_audio_output_device = std::make_shared<ai_vox::I2sStdAudioOutputDevice>(kSpeakerPinBclk, kSpeakerPinWs, kSpeakerPinDout);
+
+// 配网相关变量
+WiFiConfigState g_wifi_config_state = WiFiConfigState::IDLE;
+unsigned long g_config_start_time = 0;
+constexpr unsigned long kConfigCheckInterval = 50;
+constexpr unsigned long kConfigButtonPressTime = 5000;
+constexpr unsigned long kConfigPortalTimeout = 180000;
+WiFiManager *g_wifiManager = nullptr;
+
+// Arduino UNO通信相关变量
+HardwareSerial unoSerial(2);
+bool unoConnected = false;
+
+// 设备命令关键词列表
+std::vector<std::string> deviceKeywords = {
+    // 开关类
+    "打开灯", "关闭灯", "开灯", "关灯", "亮灯", "灭灯",
+    "打开空调", "关闭空调", "开空调", "关空调",
+    "打开电扇", "关闭电扇", "开风扇", "关风扇",
+    "打开取暖器", "关闭取暖器", "开取暖器", "关取暖器",
+    "打开车库门", "关闭车库门", "开车库门", "关车库门",
+    "打开窗帘", "关闭窗帘", "开窗帘", "关窗帘",
+    "打开抽油烟机", "关闭抽油烟机", "开油烟机", "关油烟机",
+    "打开门锁", "关闭门锁", "开锁", "关锁", "解锁", "上锁",
+    "打开水泵", "关闭水泵", "开水泵", "关水泵",
+    
+    // 玩具车控制
+    "前进", "后退", "左转", "右转", "停止", "停车",
+    
+    // 调节类
+    "增加亮度", "减少亮度", "增加速度", "减少速度", "增加声音", "减少声音",
+    
+    // 通用命令
+    "打开", "关闭", "开启", "停止", "切换"
+};
+
+void InitDisplay() {
+  printf("InitDisplay\n");
+  i2c_master_bus_handle_t display_i2c_bus;
+  i2c_master_bus_config_t bus_config = {
+      .i2c_port = I2C_NUM_0,
+      .sda_io_num = kI2cPinSda,
+      .scl_io_num = kI2cPinScl,
+      .clk_source = I2C_CLK_SRC_DEFAULT,
+      .glitch_ignore_cnt = 7,
+      .intr_priority = 0,
+      .trans_queue_depth = 0,
+      .flags =
+          {
+              .enable_internal_pullup = 1,
+              .allow_pd = false,
+          },
+  };
+  ESP_ERROR_CHECK(i2c_new_master_bus(&bus_config, &display_i2c_bus));
+
+  esp_lcd_panel_io_handle_t panel_io = nullptr;
+  esp_lcd_panel_io_i2c_config_t io_config = {
+      .dev_addr = 0x3C,
+      .on_color_trans_done = nullptr,
+      .user_ctx = nullptr,
+      .control_phase_bytes = 1,
+      .dc_bit_offset = 6,
+      .lcd_cmd_bits = 8,
+      .lcd_param_bits = 8,
+      .flags =
+          {
+              .dc_low_on_data = 0,
+              .disable_control_phase = 0,
+          },
+      .scl_speed_hz = 400 * 1000,
+  };
+  ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c_v2(display_i2c_bus, &io_config, &panel_io));
+
+  esp_lcd_panel_handle_t panel = nullptr;
+  esp_lcd_panel_dev_config_t panel_config = {};
+  panel_config.reset_gpio_num = -1;
+  panel_config.bits_per_pixel = 1;
+
+  esp_lcd_panel_ssd1306_config_t ssd1306_config = {
+      .height = static_cast<uint8_t>(kDisplayHeight),
+  };
+  panel_config.vendor_config = &ssd1306_config;
+
+  ESP_ERROR_CHECK(esp_lcd_new_panel_ssd1306(panel_io, &panel_config, &panel));
+  ESP_ERROR_CHECK(esp_lcd_panel_reset(panel));
+  ESP_ERROR_CHECK(esp_lcd_panel_init(panel));
+  ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel, true));
+  g_display = std::make_unique<Display>(panel_io, panel, kDisplayWidth, kDisplayHeight, kDisplayMirrorX, kDisplayMirrorY);
+  g_display->Start();
+}
+
+// 初始化与UNO的串口通信
+void InitUnoCommunication() {
+  Serial.println("初始化UNO串口通信");
+  unoSerial.begin(9600, SERIAL_8N1, kUnoRxPin, kUnoTxPin);
+  delay(100);
+  
+  // 发送测试连接
+  unoSerial.print("TEST:ESP32_CONNECTED\n");
+  delay(100);
+  
+  unoConnected = true;
+  Serial.println("UNO串口已初始化");
+  g_display->ShowStatus("UNO已连接");
+}
+
+// 发送命令到UNO
+void sendCommandToUno(const std::string& command) {
+    if (!unoConnected) {
+        Serial.println("UNO未连接，无法发送命令");
+        g_display->ShowStatus("UNO未连接");
+        return;
+    }
+    
+    Serial.print("发送命令到UNO: ");
+    Serial.println(command.c_str());
+    
+    // 简单发送命令文本，以换行符结束
+    unoSerial.print(command.c_str());
+    unoSerial.print("\n");
+    unoSerial.flush();
+    
+    g_display->ShowStatus("命令已发送");
+    delay(100);
+}
+
+// 检查是否是设备控制命令
+bool isDeviceCommand(const std::string& input) {
+    std::string inputLower = input;
+    std::transform(inputLower.begin(), inputLower.end(), inputLower.begin(), ::tolower);
+    
+    // 检查是否包含任何关键词
+    for (const auto& keyword : deviceKeywords) {
+        std::string keywordLower = keyword;
+        std::transform(keywordLower.begin(), keywordLower.end(), keywordLower.begin(), ::tolower);
+        
+        // 简单包含匹配
+        if (inputLower.find(keywordLower) != std::string::npos) {
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+// 非阻塞配网处理
+void ProcessWiFiConfig() {
+  switch (g_wifi_config_state) {
+    case WiFiConfigState::IDLE:
+      if (digitalRead(kTriggerPin) == LOW) {
+        g_config_start_time = millis();
+        g_wifi_config_state = WiFiConfigState::CHECKING_BUTTON;
+        g_display->ShowStatus("请保持按下5秒");
+      }
+      break;
+      
+    case WiFiConfigState::CHECKING_BUTTON:
+      if (digitalRead(kTriggerPin) == HIGH) {
+        g_wifi_config_state = WiFiConfigState::IDLE;
+        g_display->ShowStatus("配网取消");
+        return;
+      }
+      
+      if (millis() - g_config_start_time > kConfigButtonPressTime) {
+        g_wifi_config_state = WiFiConfigState::CONFIG_PORTAL;
+        g_display->ShowStatus("进入配网模式");
+        
+        if (g_wifiManager) {
+          delete g_wifiManager;
+          g_wifiManager = nullptr;
+        }
+        g_wifiManager = new WiFiManager();
+        
+        g_wifiManager->setAPCallback([](WiFiManager *wm) {
+          Serial.println("进入配网模式");
+        });
+        
+        g_wifiManager->setConnectTimeout(0);
+        g_wifiManager->setConfigPortalTimeout(300);
+        g_wifiManager->setConfigPortalBlocking(false);
+        
+        if (!g_wifiManager->startConfigPortal("AI_VOX_Config")) {
+          Serial.println("启动配网门户失败");
+        } else {
+          Serial.println("配网门户已启动");
+        }
+        g_config_start_time = millis();
+      }
+      break;
+      
+    case WiFiConfigState::CONFIG_PORTAL:
+      if (g_wifiManager) {
+        g_wifiManager->process();
+        
+        if (WiFi.status() == WL_CONNECTED) {
+          g_wifi_config_state = WiFiConfigState::CONNECTED;
+          g_display->ShowStatus("WiFi已连接");
+          printf("WiFi已连接. IP: %s\n", WiFi.localIP().toString().c_str());
+          
+          delete g_wifiManager;
+          g_wifiManager = nullptr;
+          return;
+        }
+        
+        if (millis() - g_config_start_time > kConfigPortalTimeout) {
+          g_display->ShowStatus("配网超时");
+          delay(2000);
+          
+          delete g_wifiManager;
+          g_wifiManager = nullptr;
+          ESP.restart();
+        }
+      }
+      break;
+      
+    default:
+      break;
+  }
+}
+
+void StartWiFiConfig() {
+  pinMode(kTriggerPin, INPUT_PULLUP);
+  
+  printf("尝试自动连接已保存的WiFi\n");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin();
+  
+  unsigned long start = millis();
+  bool connected = false;
+  
+  while (millis() - start < 5000) {
+    if (WiFi.status() == WL_CONNECTED) {
+      connected = true;
+      break;
+    }
+    delay(500);
+    Serial.print(".");
+  }
+  
+  if (connected) {
+    g_wifi_config_state = WiFiConfigState::CONNECTED;
+    g_display->ShowStatus("WiFi已连接");
+    printf("自动连接WiFi成功\n");
+    return;
+  }
+  
+  g_wifi_config_state = WiFiConfigState::IDLE;
+  printf("自动连接失败，等待按键配网\n");
+  g_display->ShowStatus("请长按按键5秒配网");
+}
+
+}  // namespace
+
+void setup() {
+  Serial.begin(115200);
+  printf("初始化\n");
+
+  // 第一步：初始化显示
+  InitDisplay();
+
+  // 第二步：启动配网流程
+  StartWiFiConfig();
+
+  // 第三步：初始化与Arduino UNO的串口通信
+  InitUnoCommunication();
+
+  // 初始化LED引脚
+  pinMode(kLedPin, OUTPUT);
+  digitalWrite(kLedPin, LOW);
+
+  // 其他硬件初始化
+  auto audio_input_device = std::make_shared<ai_vox::I2sStdAudioInputDevice>(kMicPinBclk, kMicPinWs, kMicPinDin);
+  auto& ai_vox_engine = ai_vox::Engine::GetInstance();
+  ai_vox_engine.SetObserver(g_observer);
+  ai_vox_engine.SetTrigger(kTriggerPin);
+  ai_vox_engine.SetOtaUrl("https://api.tenclass.net/xiaozhi/ota/");
+  ai_vox_engine.ConfigWebsocket("wss://api.tenclass.net/xiaozhi/v1/",
+                                {
+                                    {"Authorization", "Bearer test-token"},
+                                });
+  
+  if (g_wifi_config_state != WiFiConfigState::CONFIG_PORTAL) {
+      ai_vox_engine.Start(audio_input_device, g_audio_output_device);
+      if (g_wifi_config_state == WiFiConfigState::CONNECTED) {
+          g_display->ShowStatus("智能控制器启动中...");
+      }
+  }
+  printf("智能控制器已启动\n");
+}
+
+void loop() {
+    // 处理配网状态机
+    if (g_wifi_config_state != WiFiConfigState::CONNECTED) {
+        ProcessWiFiConfig();
+        delay(kConfigCheckInterval);
+        return;
+    }
+    
+    // 配网完成后显示系统就绪
+    static bool initialized = false;
+    if (!initialized) {
+        initialized = true;
+        g_display->ShowStatus("系统准备就绪");
+        g_display->SetChatMessage("请说出控制命令");
+    }
+
+    // 强制配网按钮检测
+    static unsigned long last_button_check = 0;
+    static bool button_pressed = false;
+    static unsigned long button_press_start = 0;
+    
+    if (millis() - last_button_check > 100) {
+        last_button_check = millis();
+        
+        if (digitalRead(kTriggerPin) == LOW) {
+            if (!button_pressed) {
+                button_pressed = true;
+                button_press_start = millis();
+            } else {
+                if (millis() - button_press_start > kConfigButtonPressTime) {
+                    Serial.println("检测到长按，重置WiFi设置");
+                    g_display->ShowStatus("重置WiFi...");
+                    
+                    WiFiManager wifiManager;
+                    wifiManager.resetSettings();
+                    WiFi.disconnect(true);
+                    
+                    delay(1000);
+                    ESP.restart();
+                }
+            }
+        } else {
+            if (button_pressed) {
+                button_pressed = false;
+            }
+        }
+    }
+
+    // 处理事件队列
+    const auto events = g_observer->PopEvents();
+    for (auto& event : events) {
+        if (auto activation_event = std::get_if<ai_vox::Observer::ActivationEvent>(&event)) {
+            printf("activation code: %s, message: %s\n", activation_event->code.c_str(), activation_event->message.c_str());
+            g_display->ShowStatus((std::string("激活设备") + activation_event->code).c_str());
+            g_display->SetChatMessage(activation_event->message);
+        } else if (auto state_changed_event = std::get_if<ai_vox::Observer::StateChangedEvent>(&event)) {
+            switch (state_changed_event->new_state) {
+                case ai_vox::ChatState::kIdle: {
+                    printf("Idle\n");
+                    break;
+                }
+                case ai_vox::ChatState::kIniting: {
+                    printf("Initing...\n");
+                    g_display->ShowStatus("初始化中");
+                    break;
+                }
+                case ai_vox::ChatState::kStandby: {
+                    printf("Standby\n");
+                    g_display->ShowStatus("待命状态");
+                    break;
+                }
+                case ai_vox::ChatState::kConnecting: {
+                    printf("Connecting...\n");
+                    g_display->ShowStatus("连接中...");
+                    break;
+                }
+                case ai_vox::ChatState::kListening: {
+                    printf("Listening...\n");
+                    g_display->ShowStatus("聆听中");
+                    break;
+                }
+                case ai_vox::ChatState::kSpeaking: {
+                    printf("Speaking...\n");
+                    g_display->ShowStatus("说话中");
+                    break;
+                }
+                default: {
+                    break;
+                }
+            }
+        } else if (auto emotion_event = std::get_if<ai_vox::Observer::EmotionEvent>(&event)) {
+            printf("emotion: %s\n", emotion_event->emotion.c_str());
+            g_display->SetEmotion(emotion_event->emotion);
+        } else if (auto chat_message_event = std::get_if<ai_vox::Observer::ChatMessageEvent>(&event)) {
+            switch (chat_message_event->role) {
+                case ai_vox::ChatRole::kAssistant: {
+                    printf("role: assistant, content: %s\n", chat_message_event->content.c_str());
+                    g_display->SetChatMessage(chat_message_event->content);
+                    break;
+                }
+                case ai_vox::ChatRole::kUser: {
+                    printf("role: user, content: %s\n", chat_message_event->content.c_str());
+                    
+                    // 检查用户消息是否包含设备控制命令
+                    std::string userInput = chat_message_event->content;
+                    
+                    if (isDeviceCommand(userInput)) {
+                        // 发送命令到UNO
+                        sendCommandToUno(userInput);
+                        
+                        // 语音回复确认
+                        std::string reply = "已发送命令：" + userInput;
+                        ai_vox::Observer::ChatMessageEvent replyEvent;
+                        replyEvent.role = ai_vox::ChatRole::kAssistant;
+                        replyEvent.content = reply;
+                        g_observer->PushEvent(replyEvent);
+                        
+                        // 显示命令
+                        g_display->SetChatMessage("命令: " + userInput);
+                    } else {
+                        // 普通对话，正常显示
+                        g_display->SetChatMessage(chat_message_event->content);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    
+    // 添加短延时防止任务饥饿
+    delay(10);
+    taskYIELD();
+}

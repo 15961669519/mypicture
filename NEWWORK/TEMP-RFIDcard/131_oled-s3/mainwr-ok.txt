@@ -1,0 +1,296 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <MFRC522.h>
+#include <driver/i2c_master.h>
+#include <esp_lcd_io_i2c.h>
+#include <esp_lcd_panel_ops.h>
+#include <esp_lcd_panel_ssd1306.h>
+#include <memory>
+#include "display.h"
+
+#ifndef ARDUINO_ESP32S3_DEV
+#error "This example only supports ESP32S3-Dev board."
+#endif
+
+// --- 引脚定义 ---
+constexpr gpio_num_t kI2cPinSda = GPIO_NUM_41;
+constexpr gpio_num_t kI2cPinScl = GPIO_NUM_42;
+constexpr gpio_num_t kButtonBoot = GPIO_NUM_0; // BOOT 按钮
+
+// RC522 引脚
+constexpr int kRc522PinSda  = 10;
+constexpr int kRc522PinSck  = 12;
+constexpr int kRc522PinMosi = 11;
+constexpr int kRc522PinMiso = 13;
+constexpr int kRc522PinRst  = 14;
+
+// --- 全局对象 ---
+std::unique_ptr<Display> g_display;
+MFRC522 mfrc522(kRc522PinSda, kRc522PinRst);
+
+// --- 状态变量 ---
+bool g_rc522_initialized = false;
+bool write_mode = false;          // true: 写卡模式, false: 读卡模式
+String last_result = "";          // 上一次操作结果显示
+
+// --- 函数声明 ---
+void InitDisplay();
+bool InitRC522();
+bool MFRC522_ReadBlock(byte block, byte *buffer, byte *length);
+bool MFRC522_WriteBlock(byte block, byte *buffer, byte length);
+void HandleCard();
+void printBlock(const char* label, byte* data, int len);
+
+// ==================== RC522 初始化 ====================
+bool InitRC522() {
+    Serial.println("Initializing RC522...");
+    SPI.begin(kRc522PinSck, kRc522PinMiso, kRc522PinMosi, kRc522PinSda);
+    mfrc522.PCD_Init();
+    delay(10);
+    byte v = mfrc522.PCD_ReadRegister(mfrc522.VersionReg);
+    Serial.printf("RC522 Version: 0x%02X\n", v);
+    if (v == 0x00 || v == 0xFF) return false;
+    mfrc522.PCD_SetAntennaGain(mfrc522.RxGain_max);
+    g_rc522_initialized = true;
+    return true;
+}
+
+// ==================== 读写块函数（使用默认密钥）====================
+bool MFRC522_ReadBlock(byte block, byte *buffer, byte *length) {
+    // 必须使用至少18字节的临时缓冲区（数据16字节 + CRC2字节）
+    byte tmp[18];
+    byte tmpSize = 18;
+    MFRC522::MIFARE_Key key;
+    for (byte i = 0; i < 6; i++) key.keyByte[i] = 0xFF;
+
+    // 认证
+    MFRC522::StatusCode status = mfrc522.PCD_Authenticate(
+        MFRC522::PICC_CMD_MF_AUTH_KEY_A, block, &key, &(mfrc522.uid));
+    if (status != MFRC522::STATUS_OK) {
+        Serial.print("Auth failed (block ");
+        Serial.print(block);
+        Serial.print("): ");
+        Serial.println(mfrc522.GetStatusCodeName(status));
+        return false;
+    }
+
+    // 读取（使用18字节缓冲区）
+    status = mfrc522.MIFARE_Read(block, tmp, &tmpSize);
+    if (status != MFRC522::STATUS_OK) {
+        Serial.print("Read failed (block ");
+        Serial.print(block);
+        Serial.print("), status code: ");
+        Serial.print(status);
+        Serial.print(" (");
+        Serial.print(mfrc522.GetStatusCodeName(status));
+        Serial.println(")");
+        return false;
+    }
+
+    // 复制前16字节数据到用户缓冲区
+    if (*length > 16) *length = 16;
+    memcpy(buffer, tmp, 16);
+    *length = 16;   // 固定返回16字节数据长度
+    return true;
+}
+
+bool MFRC522_WriteBlock(byte block, byte *buffer, byte length) {
+    MFRC522::MIFARE_Key key;
+    for (byte i = 0; i < 6; i++) key.keyByte[i] = 0xFF;
+
+    MFRC522::StatusCode status = mfrc522.PCD_Authenticate(
+        MFRC522::PICC_CMD_MF_AUTH_KEY_A, block, &key, &(mfrc522.uid));
+    if (status != MFRC522::STATUS_OK) {
+        Serial.print("Auth failed (block ");
+        Serial.print(block);
+        Serial.print("): ");
+        Serial.println(mfrc522.GetStatusCodeName(status));
+        return false;
+    }
+
+    status = mfrc522.MIFARE_Write(block, buffer, length);
+    if (status != MFRC522::STATUS_OK) {
+        Serial.print("Write failed (block ");
+        Serial.print(block);
+        Serial.print("): ");
+        Serial.println(mfrc522.GetStatusCodeName(status));
+        return false;
+    }
+    return true;
+}
+
+// ==================== 辅助函数：打印块数据 ====================
+void printBlock(const char* label, byte* data, int len) {
+    Serial.print(label);
+    for (int i = 0; i < len; i++) {
+        if (data[i] < 0x10) Serial.print("0");
+        Serial.print(data[i], HEX);
+        Serial.print(" ");
+    }
+    Serial.println();
+}
+
+// ==================== 卡片处理 ====================
+void HandleCard() {
+    // 检测新卡
+    if (!mfrc522.PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial()) {
+        return;
+    }
+
+    Serial.print("Card UID: ");
+    for (byte i = 0; i < mfrc522.uid.size; i++) {
+        Serial.print(mfrc522.uid.uidByte[i] < 0x10 ? " 0" : " ");
+        Serial.print(mfrc522.uid.uidByte[i], HEX);
+    }
+    Serial.println();
+
+    if (write_mode) {
+        // ---------- 写卡模式：写入游戏卡（数字99）----------
+        byte data[16] = {0};
+        data[0] = 0x01;                     // 卡类型: 游戏卡
+        data[1] = 0x00; data[2] = 0x01;     // 卡号: 1 (大端)
+        uint32_t game_num = 99;
+        data[3] = (game_num >> 24) & 0xFF;
+        data[4] = (game_num >> 16) & 0xFF;
+        data[5] = (game_num >> 8) & 0xFF;
+        data[6] = game_num & 0xFF;
+        uint16_t checksum = 0;
+        for (int i = 0; i < 7; i++) checksum += data[i];
+        data[7] = (checksum >> 8) & 0xFF;
+        data[8] = checksum & 0xFF;
+        // 其余保留为0
+
+        if (MFRC522_WriteBlock(1, data, 16)) {
+            last_result = "写入成功: 99";
+            g_display->ShowStatus("写卡 OK: 99");
+            printBlock("Written block1: ", data, 16);
+        } else {
+            last_result = "写入失败!";
+            g_display->ShowStatus("写入失败");
+        }
+    } else {
+        // ---------- 读卡模式：尝试读取块1 ----------
+        byte data[16];
+        byte len = 16;
+        bool read_ok = MFRC522_ReadBlock(1, data, &len);
+        if (read_ok) {
+            printBlock("Block1 read: ", data, len);
+            if (data[0] == 0x01) {
+                uint32_t game_num = (data[3] << 24) | (data[4] << 16) | (data[5] << 8) | data[6];
+                char buf[32];
+                snprintf(buf, sizeof(buf), "游戏卡 数字:%lu", game_num);
+                last_result = String(buf);
+                g_display->ShowStatus(buf);
+            } else {
+                last_result = "未知卡类型";
+                g_display->ShowStatus("未知卡");
+            }
+        } else {
+            // 块1读取失败，尝试读取块0（厂商块）
+            Serial.println("Block1 read failed, trying block0...");
+            byte data0[16];
+            byte len0 = 16;
+            if (MFRC522_ReadBlock(0, data0, &len0)) {
+                printBlock("Block0 read: ", data0, len0);
+                g_display->ShowStatus("读块1失败\n块0成功");
+                last_result = "块1失败，块0可读";
+            } else {
+                Serial.println("Block0 also failed!");
+                g_display->ShowStatus("读卡失败");
+                last_result = "读卡失败";
+            }
+        }
+    }
+
+    // 结束本次通信
+    mfrc522.PICC_HaltA();
+    mfrc522.PCD_StopCrypto1();
+    delay(200);
+}
+
+// ==================== 显示屏初始化 ====================
+void InitDisplay() {
+    i2c_master_bus_handle_t bus;
+    i2c_master_bus_config_t bus_cfg = {
+        .i2c_port = I2C_NUM_0,
+        .sda_io_num = kI2cPinSda,
+        .scl_io_num = kI2cPinScl,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+    };
+    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_cfg, &bus));
+
+    esp_lcd_panel_io_handle_t io;
+    esp_lcd_panel_io_i2c_config_t io_cfg = {
+        .dev_addr = 0x3C,
+        .control_phase_bytes = 1,
+        .dc_bit_offset = 6,
+        .lcd_cmd_bits = 8,
+        .lcd_param_bits = 8,
+        .scl_speed_hz = 400000
+    };
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c_v2(bus, &io_cfg, &io));
+
+    esp_lcd_panel_handle_t panel;
+    esp_lcd_panel_dev_config_t p_cfg = {
+        .reset_gpio_num = -1,
+        .bits_per_pixel = 1
+    };
+    esp_lcd_panel_ssd1306_config_t s_cfg = { .height = 64 };
+    p_cfg.vendor_config = &s_cfg;
+
+    ESP_ERROR_CHECK(esp_lcd_new_panel_ssd1306(io, &p_cfg, &panel));
+    esp_lcd_panel_reset(panel);
+    esp_lcd_panel_init(panel);
+    esp_lcd_panel_disp_on_off(panel, true);
+    g_display = std::make_unique<Display>(io, panel, 128, 64, true, true);
+    g_display->Start();
+}
+
+// ==================== 主程序 ====================
+void setup() {
+    Serial.begin(115200);
+    pinMode(kButtonBoot, INPUT_PULLUP);
+
+    InitDisplay();
+    g_display->ShowStatus("读卡模式");
+
+    if (InitRC522()) {
+        Serial.println("RC522 Ready");
+    } else {
+        Serial.println("RC522 init failed");
+        g_display->ShowStatus("RC522错误");
+    }
+}
+
+void loop() {
+    // ---------- 按键检测（短按切换模式）----------
+    static unsigned long last_press_time = 0;
+    static bool button_pressed = false;
+    bool current_state = (digitalRead(kButtonBoot) == LOW);
+
+    if (current_state && !button_pressed) {
+        button_pressed = true;
+        last_press_time = millis();
+    }
+    if (!current_state && button_pressed) {
+        button_pressed = false;
+        unsigned long press_duration = millis() - last_press_time;
+        if (press_duration < 500) {
+            write_mode = !write_mode;
+            g_display->ShowStatus(write_mode ? "写卡模式" : "读卡模式");
+            Serial.printf("Switched to %s mode\n", write_mode ? "WRITE" : "READ");
+        }
+    }
+
+    // ---------- 刷卡处理 ----------
+    static unsigned long last_card_time = 0;
+    if (millis() - last_card_time > 300) {
+        if (g_rc522_initialized) {
+            HandleCard();
+            last_card_time = millis();
+        }
+    }
+
+    delay(10);
+}

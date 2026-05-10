@@ -1,0 +1,52 @@
+<!-- 燕归乐AI-Arduino通信库 -->
+<!-- type="company" block="block/ai_arduino.js" generator="generator/ai_arduino.js" -->
+<script type="text/javascript" src="./block/ai_arduino.js"></script>
+<script type="text/javascript" src="./generator/ai_arduino.js"></script>
+
+<category id="YANGUILE_AI_ARDUINO" name="燕归乐AI-Arduino" colour="200">
+    <!-- 初始化 -->
+    <block type="yanguile_ai_arduino_init">
+        <value name="RX_PIN">
+            <shadow type="math_number">
+                <field name="NUM">4</field>
+            </shadow>
+        </value>
+        <value name="TX_PIN">
+            <shadow type="math_number">
+                <field name="NUM">3</field>
+            </shadow>
+        </value>
+        <value name="BAUD">
+            <shadow type="math_number">
+                <field name="NUM">9600</field>
+            </shadow>
+        </value>
+    </block>
+    
+    <!-- 发送 -->
+    <block type="yanguile_ai_arduino_send">
+        <value name="COMMAND">
+            <shadow type="text">
+                <field name="TEXT">播报今天天气怎么样</field>
+            </shadow>
+        </value>
+    </block>
+    
+    <!-- 处理命令（主要模块） -->
+    <block type="yanguile_ai_arduino_process">
+        <field name="DEBOUNCE_TIME">500</field>
+        <field name="TIMEOUT">2000</field>
+    </block>
+    
+    <!-- 检查模块（可以与"如果-否则"配合） -->
+    <block type="yanguile_ai_arduino_has_command"></block>
+    <block type="yanguile_ai_arduino_is_timeout"></block>
+    
+    <!-- 获取数据（主要模块） -->
+    <block type="yanguile_ai_arduino_get_verb"></block>
+    <block type="yanguile_ai_arduino_get_noun"></block>
+    
+    <!-- 管理 -->
+    <block type="yanguile_ai_arduino_clear"></block>
+    <block type="yanguile_ai_arduino_reset"></block>
+</category>

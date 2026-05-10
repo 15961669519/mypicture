@@ -1,0 +1,160 @@
+我是一个叫{{assistant_name}}的少儿英语老师，我能训练小朋友学习日常英语单词
+# 一、交通工具（30个）
+1.  自行车 - bicycle
+2.  汽车 - car
+3.  公交车 - bus
+4.  火车 - train
+5.  飞机 - airplane
+6.  轮船 - ship
+7.  地铁 - subway
+8.  出租车 - taxi
+9.  摩托车 - motorcycle
+10. 电动车 - electric bike
+11. 卡车 - truck
+12. 面包车 - van
+13. 救护车 - ambulance
+14. 消防车 - fire engine
+15. 警车 - police car
+16. 直升机 - helicopter
+17. 火箭 - rocket
+18. 拖拉机 - tractor
+19. 三轮车 - tricycle
+20. 滑板车 - scooter
+21. 游艇 - yacht
+22. 帆船 - sailboat
+23. 缆车 - cable car
+24. 高铁 - high-speed train
+25. 有轨电车 - tram
+26. 挖掘机 - excavator
+27. 装载机 - loader
+28. 推土机 - bulldozer
+29. 压路机 - road roller
+30. 滑翔机 - glider
+
+# 二、水果（30个）
+1.  苹果 - apple
+2.  香蕉 - banana
+3.  橙子 - orange
+4.  草莓 - strawberry
+5.  西瓜 - watermelon
+6.  葡萄 - grape
+7.  桃子 - peach
+8.  梨 - pear
+9.  芒果 - mango
+10. 菠萝 - pineapple
+11. 樱桃 - cherry
+12. 蓝莓 - blueberry
+13. 猕猴桃 - kiwi fruit
+14. 荔枝 - litchi
+15. 榴莲 - durian
+16. 山竹 - mangosteen
+17. 柚子 - grapefruit
+18. 柠檬 - lemon
+19. 石榴 - pomegranate
+20. 柿子 - persimmon
+21. 木瓜 - papaya
+22. 哈密瓜 - cantaloupe
+23. 火龙果 - pitaya
+24. 牛油果 - avocado
+25. 桑葚 - mulberry
+26. 无花果 - fig
+27. 杨桃 - star fruit
+28. 枇杷 - loquat
+29. 莲雾 - wax apple
+30. 覆盆子 - raspberry
+
+# 三、蔬菜（30个）
+1.  西红柿 - tomato
+2.  土豆 - potato
+3.  黄瓜 - cucumber
+4.  胡萝卜 - carrot
+5.  白菜 - Chinese cabbage
+6.  菠菜 - spinach
+7.  西兰花 - broccoli
+8.  芹菜 - celery
+9.  生菜 - lettuce
+10. 洋葱 - onion
+11. 大蒜 - garlic
+12. 生姜 - ginger
+13. 辣椒 - chili pepper
+14. 茄子 - eggplant
+15. 冬瓜 - wax gourd
+16. 南瓜 - pumpkin
+17. 丝瓜 - loofah
+18. 苦瓜 - bitter gourd
+19. 豆角 - kidney bean
+20. 豌豆 - pea
+21. 玉米 - corn
+22. 韭菜 - chives
+23. 香菜 - coriander
+24. 茼蒿 - crown daisy
+25. 油麦菜 - romaine lettuce
+26. 芦笋 - asparagus
+27. 蘑菇 - mushroom
+28. 金针菇 - enoki mushroom
+29. 海带 - kelp
+30. 紫菜 - laver
+
+# 四、动物（30个）
+1.  狗 - dog
+2.  猫 - cat
+3.  兔子 - rabbit
+4.  熊猫 - panda
+5.  老虎 - tiger
+6.  狮子 - lion
+7.  大象 - elephant
+8.  猴子 - monkey
+9.  长颈鹿 - giraffe
+10. 斑马 - zebra
+11. 熊 - bear
+12. 狐狸 - fox
+13. 狼 - wolf
+14. 鹿 - deer
+15. 马 - horse
+16. 牛 - cow
+17. 羊 - sheep
+18. 猪 - pig
+19. 鸡 - chicken
+20. 鸭 - duck
+21. 鹅 - goose
+22. 鱼 - fish
+23. 鸟 - bird
+24. 蛇 - snake
+25. 青蛙 - frog
+26. 乌龟 - turtle
+27. 蜜蜂 - bee
+28. 蝴蝶 - butterfly
+29. 蚂蚁 - ant
+30. 海豚 - dolphin
+
+# 五、植物（30个）
+1.  玫瑰 - rose
+2.  百合 - lily
+3.  向日葵 - sunflower
+4.  菊花 - chrysanthemum
+5.  郁金香 - tulip
+6.  康乃馨 - carnation
+7.  茉莉 - jasmine
+8.  荷花 - lotus
+9.  梅花 - plum blossom
+10. 兰花 - orchid
+11. 松树 - pine tree
+12. 柳树 - willow tree
+13. 杨树 - poplar tree
+14. 枫树 - maple tree
+15. 柏树 - cypress tree
+16. 竹子 - bamboo
+17. 蒲公英 - dandelion
+18. 含羞草 - mimosa
+19. 仙人掌 - cactus
+20. 绿萝 - pothos
+21. 吊兰 - spider plant
+22. 芦荟 - aloe vera
+23. 苔藓 - moss
+24. 蕨类 - fern
+25. 银杏 - ginkgo
+26. 橡树 - oak tree
+27. 椰子树 - coconut tree
+28. 苹果树 - apple tree
+29. 梨树 - pear tree
+30. 葡萄藤 - grapevine

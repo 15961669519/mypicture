@@ -1,0 +1,556 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <driver/i2c_master.h>
+#include <esp_lcd_io_i2c.h>
+#include <esp_lcd_panel_ops.h>
+#include <esp_lcd_panel_ssd1306.h>
+#include <WiFiManager.h>
+#include <SPI.h>
+#include <MFRC522.h>
+#include <DFRobotDFPlayerMini.h>
+
+#include "ai_vox_engine.h"
+#include "audio_device/audio_input_device_i2s_std.h"
+#include "audio_device/audio_input_device_pdm.h"
+#include "audio_device/audio_output_device_i2s_std.h"
+#include "components/espressif/button/button_gpio.h"
+#include "components/espressif/button/iot_button.h"
+#include "display.h"
+
+#ifndef ARDUINO_ESP32S3_DEV
+#error "This example only supports ESP32S3-Dev board."
+#endif
+
+#define AUDIO_INPUT_DEVICE_TYPE_I2S_STD (1)
+#define AUDIO_INPUT_DEVICE_TYPE AUDIO_INPUT_DEVICE_TYPE_I2S_STD
+
+// --- 引脚定义 ---
+constexpr gpio_num_t kMicPinSck = GPIO_NUM_5;
+constexpr gpio_num_t kMicPinWs = GPIO_NUM_4;
+constexpr gpio_num_t kMicPinSd = GPIO_NUM_6;
+
+constexpr gpio_num_t kSpeakerPinSck = GPIO_NUM_15;
+constexpr gpio_num_t kSpeakerPinWs = GPIO_NUM_16;
+constexpr gpio_num_t kSpeakerPinSd = GPIO_NUM_7;
+
+constexpr gpio_num_t kI2cPinSda = GPIO_NUM_41;
+constexpr gpio_num_t kI2cPinScl = GPIO_NUM_42;
+
+constexpr gpio_num_t kButtonBoot = GPIO_NUM_0; // BOOT 按钮
+
+// RC522 引脚
+constexpr int kRc522PinSda  = 10;
+constexpr int kRc522PinSck  = 12;
+constexpr int kRc522PinMosi = 11;
+constexpr int kRc522PinMiso = 13;
+constexpr int kRc522PinRst  = 14;
+
+// DFPlayer 引脚 (使用UART2)
+constexpr int kDfPlayerTx = GPIO_NUM_17;  
+constexpr int kDfPlayerRx = GPIO_NUM_18;  
+constexpr int kDfPlayerBusy = GPIO_NUM_21; 
+
+// --- 全局对象 ---
+std::unique_ptr<Display> g_display;
+auto g_observer = std::make_shared<ai_vox::Observer>();
+auto g_audio_output_device = std::make_shared<ai_vox::AudioOutputDeviceI2sStd>(kSpeakerPinSck, kSpeakerPinWs, kSpeakerPinSd);
+button_handle_t g_button_boot_handle = nullptr;
+MFRC522 mfrc522(kRc522PinSda, kRc522PinRst); 
+DFRobotDFPlayerMini g_dfplayer;  
+HardwareSerial dfplayerSerial(2); 
+
+// --- 状态变量 ---
+bool g_wifi_connected = false;
+String g_last_card_id = "";
+unsigned long g_last_card_time = 0;
+bool g_rc522_initialized = false;
+bool g_dfplayer_initialized = false;
+int64_t g_current_volume = 20;  
+bool g_is_playing = false;
+
+// ========== 单曲播放模式（播放完成后停止，不自动下一首） ==========
+bool g_single_play_mode = false;
+
+// ========== DFPlayer 播放状态（适配文件夹模式） ==========
+int64_t g_current_folder = 1;      // 当前文件夹编号（固定使用01）
+int64_t g_current_track = 1;       // 当前曲目编号（1~255）
+// ========================================================
+
+// ---------- DFPlayer 稳健性相关 ----------
+unsigned long g_ignore_busy_until = 0;
+const int kBusyDebounceCount = 5;   // BUSY 防抖：连续检测到 HIGH 的次数
+int g_busy_high_counter = 0;
+// -----------------------------------------
+
+// --- 函数声明 ---
+void InitDisplay();
+void HandleWiFiConnection();
+void InitMcpTools();
+bool InitRC522();
+String ReadCardNumber();
+bool InitDFPlayer();
+void WiFiResetCallback(void* arg, void* data);
+
+// ========== DFPlayer 播放控制函数（文件夹模式） ==========
+void PlayTrack(int folder, int track);   // 播放指定文件夹、指定曲目
+void PlayTrack(int track);              // 重载：使用默认文件夹(01)
+void PlayNextTrack();
+void PlayPreviousTrack();
+// ========================================================
+
+// --- RC522 初始化 ---
+bool InitRC522() {
+    printf("Initializing RC522...\n");
+    SPI.begin(kRc522PinSck, kRc522PinMiso, kRc522PinMosi, kRc522PinSda);
+    mfrc522.PCD_Init();
+    delay(10);
+    byte v = mfrc522.PCD_ReadRegister(mfrc522.VersionReg);
+    printf("RC522 Version: 0x%02X\n", v);
+    if (v == 0x00 || v == 0xFF) return false;
+    mfrc522.PCD_SetAntennaGain(mfrc522.RxGain_max);
+    g_rc522_initialized = true;
+    return true;
+}
+
+String ReadCardNumber() {
+    if (!g_rc522_initialized) return "";
+    if (!mfrc522.PICC_IsNewCardPresent()) return "";
+    if (!mfrc522.PICC_ReadCardSerial()) return "";
+    String cardId = "";
+    for (byte i = 0; i < mfrc522.uid.size; i++) {
+        cardId += (mfrc522.uid.uidByte[i] < 0x10 ? "0" : "");
+        cardId += String(mfrc522.uid.uidByte[i], HEX);
+        if (i < mfrc522.uid.size - 1) cardId += ":";
+    }
+    cardId.toUpperCase();
+    mfrc522.PICC_HaltA();
+    mfrc522.PCD_StopCrypto1();
+    return cardId;
+}
+
+// ==================== DFPlayer 初始化（增强版） ====================
+bool InitDFPlayer() {
+    printf("Initializing DFPlayer Mini...\n");
+    printf("NOTE: MP3 files must be placed in /01/001.mp3, /01/002.mp3...\n");
+    dfplayerSerial.begin(9600, SERIAL_8N1, kDfPlayerRx, kDfPlayerTx);
+    delay(500);
+
+    if (!g_dfplayer.begin(dfplayerSerial, false, true)) {
+        printf("DFPlayer initialization FAILED!\n");
+        g_dfplayer_initialized = false;
+        return false;
+    }
+    delay(1000);
+
+    g_dfplayer.volume(static_cast<int>(g_current_volume));
+    g_dfplayer.EQ(DFPLAYER_EQ_NORMAL);
+    g_dfplayer.outputDevice(DFPLAYER_DEVICE_SD);
+
+    if (kDfPlayerBusy > 0) {
+        pinMode(kDfPlayerBusy, INPUT);
+    }
+
+    g_dfplayer_initialized = true;
+    printf("DFPlayer initialized, volume = %lld\n", g_current_volume);
+    return true;
+}
+
+// 播放指定文件夹、指定曲目（文件夹编号 1~99，曲目编号 1~255）
+void PlayTrack(int folder, int track) {
+    if (!g_dfplayer_initialized) {
+        printf("DFPlayer not initialized, cannot play.\n");
+        return;
+    }
+    if (folder < 1) folder = 1;
+    if (folder > 99) folder = 1;
+    if (track < 1) track = 1;
+    if (track > 255) track = 1;
+
+    g_dfplayer.playFolder(folder, track);
+    printf("▶ Playing folder %d, track %d (/%02d/%03d.mp3)\n", folder, track, folder, track);
+
+    g_current_folder = folder;
+    g_current_track = track;
+    g_is_playing = true;
+
+    g_ignore_busy_until = millis() + 1000;
+    g_busy_high_counter = 0;
+
+    g_display->ShowStatus(("播放: " + String(folder) + "-" + String(track)).c_str());
+}
+
+// 重载：使用默认文件夹 01
+void PlayTrack(int track) {
+    PlayTrack(1, track);
+}
+
+// 播放下一个曲目（同一文件夹内循环）
+void PlayNextTrack() {
+    int next = g_current_track + 1;
+    if (next > 255) next = 1;
+    PlayTrack(g_current_folder, next);
+}
+
+// 播放上一个曲目（同一文件夹内循环）
+void PlayPreviousTrack() {
+    int prev = g_current_track - 1;
+    if (prev < 1) prev = 255;
+    PlayTrack(g_current_folder, prev);
+}
+// =================================================================
+
+// --- 核心初始化 ---
+void setup() {
+    Serial.begin(115200);
+    pinMode(kButtonBoot, INPUT_PULLUP);
+
+    InitDisplay();
+    g_display->ShowStatus("系统启动中...");
+
+    if (InitRC522()) printf("RC522 Ready\n");
+
+    if (InitDFPlayer()) {
+        printf("DFPlayer Ready\n");
+        // 开机播放 /01/099.mp3，单曲模式（播放完停止）
+        g_single_play_mode = true;
+        PlayTrack(1, 99);
+    } else {
+        g_display->ShowStatus("DFPlayer 错误");
+        printf("DFPlayer init failed, playback disabled.\n");
+    }
+
+    WiFi.mode(WIFI_STA);
+    WiFi.begin();
+    
+    unsigned long start = millis();
+    g_display->ShowStatus("正在连接WiFi...");
+    while (millis() - start < 3000) {
+        if (WiFi.status() == WL_CONNECTED) {
+            g_wifi_connected = true;
+            g_display->ShowStatus("WiFi 已连接");
+            break;
+        }
+        delay(100);
+    }
+    
+    if (!g_wifi_connected) {
+        g_display->ShowStatus("连接失败\n长按5秒配网");
+    }
+}
+
+void loop() {
+    // 1. WiFi 配网与重连处理
+    if (!g_wifi_connected) {
+        HandleWiFiConnection();
+        delay(50);
+        return;
+    }
+
+    // 2. AI 引擎初始化（仅一次）
+    static bool engine_started = false;
+    if (!engine_started) {
+        engine_started = true;
+        InitMcpTools();
+
+        auto audio_input_device = std::make_shared<ai_vox::AudioInputDeviceI2sStd>(kMicPinSck, kMicPinWs, kMicPinSd);
+        auto& engine = ai_vox::Engine::GetInstance();
+        engine.SetObserver(g_observer);
+        engine.SetOtaUrl("https://api.tenclass.net/xiaozhi/ota/");
+        engine.ConfigWebsocket("wss://api.tenclass.net/xiaozhi/v1/", {{"Authorization", "Bearer test-token"}});
+        
+        engine.Start(audio_input_device, g_audio_output_device);
+        g_display->ShowStatus("AI 已就绪");
+
+        const button_config_t btn_cfg = { .long_press_time = 5000, .short_press_time = 50 };
+        const button_gpio_config_t gpio_cfg = { .gpio_num = kButtonBoot, .active_level = 0 };
+        iot_button_new_gpio_device(&btn_cfg, &gpio_cfg, &g_button_boot_handle);
+        
+        iot_button_register_cb(g_button_boot_handle, BUTTON_PRESS_DOWN, nullptr, [](void* b, void* u){
+            ai_vox::Engine::GetInstance().Advance();
+        }, nullptr);
+
+        iot_button_register_cb(g_button_boot_handle, BUTTON_LONG_PRESS_START, nullptr, WiFiResetCallback, nullptr);
+    }
+
+    // 3. 周期性读卡检测
+    static unsigned long last_rfid_check = 0;
+    if (millis() - last_rfid_check > 500) {
+        last_rfid_check = millis();
+        String cid = ReadCardNumber();
+        if (cid != "") {
+            g_last_card_id = cid;
+            g_last_card_time = millis();
+            g_display->ShowStatus(("卡号: " + cid).c_str());
+            // 刷卡播放 /01/098.mp3，单曲模式（播放完停止）
+            g_single_play_mode = true;
+            PlayTrack(1, 98);
+        }
+    }
+
+    // 4. DFPlayer 维护：自动下一首（带防抖），并处理单曲模式
+    if (g_dfplayer_initialized && g_is_playing) {
+        while (g_dfplayer.available()) {
+            int type = g_dfplayer.readType();
+            int value = g_dfplayer.read();
+            if (type == DFPlayerError) {
+                printf("DFPlayer error: %d\n", value);
+            } else if (type == DFPlayerPlayFinished) {
+                printf("Track %d finished (module feedback)\n", value);
+            }
+        }
+
+        if (millis() > g_ignore_busy_until) {
+            bool busy_pin = digitalRead(kDfPlayerBusy);
+            if (busy_pin == HIGH) {
+                g_busy_high_counter++;
+                if (g_busy_high_counter >= kBusyDebounceCount) {
+                    printf("BUSY HIGH sustained, folder %lld track %lld finished\n", 
+                           g_current_folder, g_current_track);
+                    g_busy_high_counter = 0;
+                    if (g_single_play_mode) {
+                        // 单曲播放结束，停止并清除模式
+                        g_dfplayer.stop();
+                        g_is_playing = false;
+                        g_single_play_mode = false;
+                        g_display->ShowStatus("播放结束");
+                    } else {
+                        PlayNextTrack();
+                    }
+                }
+            } else {
+                g_busy_high_counter = 0;
+            }
+        }
+    } else {
+        g_busy_high_counter = 0;
+    }
+
+    // 5. AI 事件处理
+    auto& engine = ai_vox::Engine::GetInstance();
+    const auto events = g_observer->PopEvents();
+    for (auto& event : events) {
+        if (auto state_event = std::get_if<ai_vox::StateChangedEvent>(&event)) {
+            if(state_event->new_state == ai_vox::ChatState::kSpeaking) g_display->ShowStatus("说话中");
+            if(state_event->new_state == ai_vox::ChatState::kListening) g_display->ShowStatus("聆听中");
+        } 
+        else if (auto msg_event = std::get_if<ai_vox::ChatMessageEvent>(&event)) {
+            g_display->SetChatMessage(msg_event->content);
+        }
+        else if (auto mcp_event = std::get_if<ai_vox::McpToolCallEvent>(&event)) {
+            // --- MCP 工具调用（适配文件夹模式）---
+            if (mcp_event->name == "self.rfid.get_last_card") {
+                engine.SendMcpCallResponse(mcp_event->id, g_last_card_id.length() > 0 ? g_last_card_id.c_str() : "No card detected");
+            } 
+            else if (mcp_event->name == "self.rfid.read_now") {
+                String cid = ReadCardNumber();
+                engine.SendMcpCallResponse(mcp_event->id, cid != "" ? cid.c_str() : "No card near reader");
+            }
+            // ---------- DFPlayer 控制（支持 folder + track）----------
+            else if (mcp_event->name == "self.dfplayer.play") {
+                if (!g_dfplayer_initialized) {
+                    engine.SendMcpCallResponse(mcp_event->id, "DFPlayer not initialized");
+                    continue;
+                }
+                auto folder = mcp_event->param<int64_t>("folder");
+                auto track = mcp_event->param<int64_t>("track");
+                
+                if (folder && track) {
+                    g_single_play_mode = false;  // AI 指令播放使用自动下一首
+                    PlayTrack((int)*folder, (int)*track);
+                    engine.SendMcpCallResponse(mcp_event->id, true);
+                } else if (track) {
+                    g_single_play_mode = false;
+                    PlayTrack((int)*track);
+                    engine.SendMcpCallResponse(mcp_event->id, true);
+                } else {
+                    engine.SendMcpCallResponse(mcp_event->id, false);
+                }
+            }
+            else if (mcp_event->name == "self.dfplayer.pause") {
+                if (!g_dfplayer_initialized) {
+                    engine.SendMcpCallResponse(mcp_event->id, "DFPlayer not initialized");
+                    continue;
+                }
+                g_dfplayer.pause();
+                g_is_playing = false;
+                g_display->ShowStatus("暂停");
+                engine.SendMcpCallResponse(mcp_event->id, true);
+            }
+            else if (mcp_event->name == "self.dfplayer.resume") {
+                if (!g_dfplayer_initialized) {
+                    engine.SendMcpCallResponse(mcp_event->id, "DFPlayer not initialized");
+                    continue;
+                }
+                g_dfplayer.start();
+                g_is_playing = true;
+                g_ignore_busy_until = millis() + 500;
+                g_display->ShowStatus("继续播放");
+                engine.SendMcpCallResponse(mcp_event->id, true);
+            }
+            else if (mcp_event->name == "self.dfplayer.stop") {
+                if (!g_dfplayer_initialized) {
+                    engine.SendMcpCallResponse(mcp_event->id, "DFPlayer not initialized");
+                    continue;
+                }
+                g_dfplayer.stop();
+                g_is_playing = false;
+                g_single_play_mode = false;  // 手动停止取消单曲模式
+                g_display->ShowStatus("停止");
+                engine.SendMcpCallResponse(mcp_event->id, true);
+            }
+            else if (mcp_event->name == "self.dfplayer.volume") {
+                if (!g_dfplayer_initialized) {
+                    engine.SendMcpCallResponse(mcp_event->id, "DFPlayer not initialized");
+                    continue;
+                }
+                auto volume = mcp_event->param<int64_t>("level");
+                if (volume) {
+                    int64_t vol = *volume;
+                    if (vol < 0) vol = 0;
+                    if (vol > 30) vol = 30;
+                    g_dfplayer.volume((int)vol);
+                    g_current_volume = vol;
+                    g_display->ShowStatus(("音量: " + String((int)vol)).c_str());
+                }
+                engine.SendMcpCallResponse(mcp_event->id, true);
+            }
+            else if (mcp_event->name == "self.dfplayer.next") {
+                if (!g_dfplayer_initialized) {
+                    engine.SendMcpCallResponse(mcp_event->id, "DFPlayer not initialized");
+                    continue;
+                }
+                g_single_play_mode = false;  // 手动切换下一首，取消单曲模式
+                PlayNextTrack();
+                engine.SendMcpCallResponse(mcp_event->id, true);
+            }
+            else if (mcp_event->name == "self.dfplayer.previous") {
+                if (!g_dfplayer_initialized) {
+                    engine.SendMcpCallResponse(mcp_event->id, "DFPlayer not initialized");
+                    continue;
+                }
+                g_single_play_mode = false;
+                PlayPreviousTrack();
+                engine.SendMcpCallResponse(mcp_event->id, true);
+            }
+            else if (mcp_event->name == "self.dfplayer.get_status") {
+                String status = "DFPlayer: ";
+                status += g_dfplayer_initialized ? "OK" : "Not initialized";
+                status += ", Folder:" + String((int)g_current_folder);
+                status += ", Track:" + String((int)g_current_track);
+                status += ", ";
+                status += g_is_playing ? "Playing" : "Stopped";
+                status += ", Vol:" + String((int)g_current_volume);
+                engine.SendMcpCallResponse(mcp_event->id, status.c_str());
+            }
+            // -------------------------------------------------------
+        }
+    }
+    
+    delay(10);
+}
+
+// --- WiFi 配网逻辑（配网AP名称改为“AI-燕归乐”）---
+void HandleWiFiConnection() {
+    static unsigned long press_start_time = 0;
+    static bool is_pressing = false;
+    
+    bool current_pressed = (digitalRead(kButtonBoot) == LOW);
+    
+    if (current_pressed) {
+        if (!is_pressing) {
+            is_pressing = true;
+            press_start_time = millis();
+            printf("Button pressed, starting counter...\n");
+        } else {
+            unsigned long duration = millis() - press_start_time;
+            static unsigned long last_ui = 0;
+            if (millis() - last_ui > 200) {
+                last_ui = millis();
+                int remaining = 5 - (duration / 1000);
+                if (remaining < 0) remaining = 0;
+                String msg = "配网倒计时: " + String(remaining);
+                g_display->ShowStatus(msg.c_str());
+            }
+            if (duration > 5000) {
+                g_display->ShowStatus("正在开启热点...");
+                WiFiManager wm;
+                wm.setConfigPortalTimeout(180);
+                wm.setBreakAfterConfig(true);
+                // 修改AP名称为“AI-燕归乐”
+                String apName = "AI-燕归乐";
+                bool res = wm.startConfigPortal(apName.c_str());
+                if (res) {
+                    g_display->ShowStatus("WiFi 配网成功!");
+                    g_wifi_connected = true;
+                    delay(1000);
+                } else {
+                    g_display->ShowStatus("配网失败\n系统将重启");
+                    delay(2000);
+                    ESP.restart();
+                }
+                is_pressing = false;
+            }
+        }
+    } else {
+        if (is_pressing) {
+            is_pressing = false;
+            g_display->ShowStatus("长按5秒配网");
+        }
+    }
+}
+
+void WiFiResetCallback(void* arg, void* data) {
+    g_display->ShowStatus("正在重置WiFi...");
+    delay(1000);
+    WiFiManager wm;
+    wm.resetSettings();
+    g_display->ShowStatus("WiFi已清除\n系统重启中");
+    delay(2000);
+    ESP.restart();
+}
+
+// --- 显示屏初始化（保持不变）---
+void InitDisplay() {
+    i2c_master_bus_handle_t bus;
+    i2c_master_bus_config_t bus_cfg = {
+        .i2c_port = I2C_NUM_0, .sda_io_num = kI2cPinSda, .scl_io_num = kI2cPinScl,
+        .clk_source = I2C_CLK_SRC_DEFAULT, .glitch_ignore_cnt = 7,
+    };
+    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_cfg, &bus));
+
+    esp_lcd_panel_io_handle_t io;
+    esp_lcd_panel_io_i2c_config_t io_cfg = { .dev_addr = 0x3C, .control_phase_bytes = 1, .dc_bit_offset = 6, .lcd_cmd_bits = 8, .lcd_param_bits = 8, .scl_speed_hz = 400000 };
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c_v2(bus, &io_cfg, &io));
+
+    esp_lcd_panel_handle_t panel;
+    esp_lcd_panel_dev_config_t p_cfg = { .reset_gpio_num = -1, .bits_per_pixel = 1 };
+    esp_lcd_panel_ssd1306_config_t s_cfg = { .height = 64 };
+    p_cfg.vendor_config = &s_cfg;
+
+    ESP_ERROR_CHECK(esp_lcd_new_panel_ssd1306(io, &p_cfg, &panel));
+    esp_lcd_panel_reset(panel);
+    esp_lcd_panel_init(panel);
+    esp_lcd_panel_disp_on_off(panel, true);
+    g_display = std::make_unique<Display>(io, panel, 128, 64, true, true);
+    g_display->Start();
+}
+
+// --- MCP 工具注册（适配文件夹模式）---
+void InitMcpTools() {
+    auto& engine = ai_vox::Engine::GetInstance();
+    engine.AddMcpTool("self.rfid.get_last_card", "Get last RFID", {});
+    engine.AddMcpTool("self.rfid.read_now", "Read card now", {});
+    
+    // DFPlayer 工具：支持 folder 和 track 参数
+    engine.AddMcpTool("self.dfplayer.play", "Play MP3 from folder", {
+        {"folder", ai_vox::ParamSchema<int64_t>{}},
+        {"track", ai_vox::ParamSchema<int64_t>{}}
+    });
+    engine.AddMcpTool("self.dfplayer.pause", "Pause", {});
+    engine.AddMcpTool("self.dfplayer.resume", "Resume", {});
+    engine.AddMcpTool("self.dfplayer.stop", "Stop", {});
+    engine.AddMcpTool("self.dfplayer.volume", "Set volume (0-30)", {{"level", ai_vox::ParamSchema<int64_t>{}}});
+    engine.AddMcpTool("self.dfplayer.next", "Next track in current folder", {});
+    engine.AddMcpTool("self.dfplayer.previous", "Previous track in current folder", {});
+    engine.AddMcpTool("self.dfplayer.get_status", "Get DFPlayer status", {});
+}

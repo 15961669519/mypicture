@@ -1,0 +1,99 @@
+这份大纲已经为您进行了深度结构化拆解，提取了最核心的短句以适应 PPT 的排版需求。为了提升演示的视觉效果，**图示建议**部分为您构思了以 3D 渲染、半写实动漫风格为主的视觉画面提示词（Prompt），方便您直接用于 AI 绘图工具生成高质量的 PPT 配图。
+
+---
+
+## 第 1 页：封面
+* **标题**：RFID 智能寻宝游戏操作手册
+* **副标题**：基于 ESP32 与 RC522 的沉浸式互动体验
+* **正文要点**：
+    * [cite_start]硬件基础：ESP32 + RC522 [cite: 1]
+    * [cite_start]核心载体：Mifare S50 芯片卡 [cite: 1]
+* **图示建议**：
+    * **画面构图**：一张散发着全息光芒的智能卡片悬浮在极简方形机盒上方。
+    * **风格参考**：3D-rendered, semi-realistic anime aesthetics, intricate device details, Unreal Engine 5 lighting, octane render, futuristic technology feel.
+
+---
+
+## 第 2 页：游戏系统与设备概述
+* **标题**：双机协同：主机与子机
+* **正文要点**：
+    * [cite_start]**外观统一**：主机与子机均为方形盒子，外观一致，仅内部程序不同 [cite: 1]。
+    * **角色分工**：
+        * [cite_start]主机：NPC/管理员专用（发卡、发任务、监控） [cite: 1]。
+        * [cite_start]子机：玩家专用（寻宝打卡、进度保存、交易） [cite: 1]。
+* **图示建议**：
+    * **画面构图**：桌面上并排放置两个质感极佳的方形设备，分别标注“Master”和“Slave”全息投影。
+    * **风格参考**：3D-rendered, desktop still life, octane render, semi-realistic, soft studio lighting.
+
+---
+
+## 第 3 页：核心道具卡片
+* **标题**：双卡驱动：任务卡 vs 寻宝卡
+* **正文要点**：
+    * [cite_start]**寻宝卡（实体宝藏）**：直径 5CM 圆形卡，预写 1~100 唯一数字 [cite: 1]。
+    * [cite_start]**任务卡（玩家身份）**：名片大小方形卡 [cite: 1]。
+    * [cite_start]**任务卡数据**：记录玩家编号、7 个随机任务数字、当前进度（如 3/7）、累计得分 [cite: 1]。
+* **图示建议**：
+    * **画面构图**：画面左侧是一张名片大小的方形卡片（带有数据面板 UI），右侧是一枚 5CM 的圆形硬币状卡片，两者形成鲜明对比。
+    * **风格参考**：3D-rendered, semi-realistic anime style, intricate UI elements floating, cinematic lighting.
+
+---
+
+## 第 4 页：主机操作 - 模式切换
+* **标题**：主机管理：三大模式一键切换
+* **正文要点**：
+    * [cite_start]**操作方式**：通过短按主机按钮在三种模式间循环 [cite: 1]。
+    * [cite_start]**模式一**：写卡模式（批量制作寻宝卡） [cite: 1]。
+    * [cite_start]**模式二**：分配任务模式（新建玩家任务卡） [cite: 1]。
+    * [cite_start]**模式三**：读卡模式（后台监控与查验） [cite: 1]。
+* **图示建议**：
+    * **画面构图**：一只戴着半指战术手套的手正准备按下方形盒子上的物理按钮，按钮上方浮现三个轮播的模式图标。
+    * **风格参考**：3D-rendered, intricate character details (hands/gloves), semi-realistic anime aesthetics, glowing icons, UE5.
+
+---
+
+## 第 5 页：主机操作 - 道具制作
+* **标题**：游戏初始化：发卡与发任务
+* **正文要点**：
+    * [cite_start]**制作寻宝卡**：串口输入 1~100 纯数字 $\rightarrow$ 放空白圆卡 $\rightarrow$ 自动写入并验证 [cite: 1]。
+    * [cite_start]**制作任务卡**：系统随机生成 7 个互异数字 $\rightarrow$ 放空白方卡 $\rightarrow$ 自动写入编号、任务、0 分初始值、全 0 未完成状态 [cite: 1]。
+* **图示建议**：
+    * **画面构图**：一位银发动漫少女（NPC视角）坐在电脑前，通过串口线连接着主机设备，正将空白卡片贴向感应区。
+    * **风格参考**：Silver-haired female character, semi-realistic anime aesthetics, intricate fabric details, octane render, cozy warm lighting.
+
+---
+
+## 第 6 页：主机操作 - 进度监控
+* **标题**：防作弊与进度查验
+* **正文要点**：
+    * [cite_start]**查验寻宝卡**：直接显示卡内隐藏的宝藏数字 [cite: 1]。
+    * [cite_start]**查验任务卡**：显示该玩家编号、任务列表、已完成进度、当前总分 [cite: 1]。
+    * [cite_start]**异常拦截**：格式不符的卡片一律拦截并显示“非法卡” [cite: 1]。
+* **图示建议**：
+    * **画面构图**：主机设备屏幕特写，屏幕上显示着清晰的数据面板（玩家编号、进度条），屏幕边缘闪烁着绿色的验证通过光芒。
+    * **风格参考**：3D-rendered, macro shot, intricate screen UI details, semi-realistic, depth of field.
+
+---
+
+## 第 7 页：子机操作 - 寻宝打卡 (核心玩法)
+* **标题**：玩家主线：寻宝与得分机制
+* **正文要点**：
+    * [cite_start]**读取（起手式）**：先刷个人任务卡，将数据加载至子机内存 [cite: 1]。
+    * [cite_start]**验证（找宝藏）**：找到圆形寻宝卡后刷卡验证。匹配且未完成则 **+10 分**，否则提示不匹配/已完成 [cite: 1]。
+    * [cite_start]**保存（关键步）**：必须再次刷任务卡，将新得分和状态写入卡片 [cite: 1][cite_start]。（注：断电内存清空，需重刷任务卡加载 [cite: 1]）
+* **图示建议**：
+    * **画面构图**：玩家手持圆形寻宝卡触碰方形子机，子机上方弹出一个立体的“+10 Score”金币特效。
+    * **风格参考**：3D-rendered, semi-realistic anime, intricate dynamic effects, UE5 particle system, bright and energetic lighting.
+
+---
+
+## 第 8 页：子机操作 - 自由交易机制
+* **标题**：玩家支线：卖宝模式与积分流转
+* **正文要点**：
+    * [cite_start]**交易场景**：卖家有多余寻宝卡，买家需要该数字 [cite: 1][cite_start]。通过短按子机切至“卖宝模式” [cite: 1]。
+    * [cite_start]**积分扣减**：卖家先刷买家任务卡（检验积分 $\ge$ 5 分 $\rightarrow$ 扣除 5 分并写回） [cite: 1]。
+    * [cite_start]**积分增加**：卖家再刷自己任务卡（增加 5 分并写回） [cite: 1]。
+    * [cite_start]**双赢闭环**：卖家交出实体卡 [cite: 1][cite_start]，买家切回寻宝模式刷卡得分（花 5 分赚 10 分，净赚 5 分） [cite: 1]。
+* **图示建议**：
+    * **画面构图**：两名玩家（可设定为精细的 3D 半写实动漫角色）正在进行卡片交易，两人之间有全息的积分箭头流动（-5 分流出，+5 分流入）。
+    * **风格参考**：3D-rendered, semi-realistic anime aesthetics, intricate character interactions, UE5, octane render, holographic UI trading effects.

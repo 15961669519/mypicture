@@ -1,0 +1,145 @@
+#include <Arduino.h>
+#include <esp_now.h>
+#include <WiFi.h>
+
+// 根据资源表定义的GPIO映射
+#define PIN_LSTICK_Y    0   // 左摇杆Y
+#define PIN_LSTICK_X    1   // 左摇杆X
+#define PIN_RSTICK_Y    3   // 右摇杆Y
+#define PIN_RSTICK_X    4   // 右摇杆X
+#define PIN_R3          5   // 右摇杆按键
+#define PIN_L1          2   // L1
+#define PIN_L2          18   // L2
+#define PIN_UP          7   // 上
+#define PIN_L3          8   // 左摇杆按键
+#define PIN_RIGHT       9   // 右
+#define PIN_TRIANGLE    10  // △
+#define PIN_R1          11  // R1
+#define PIN_CIRCLE      12  // ○
+#define PIN_R2          13  // R2
+#define PIN_DOWN        6  // 下
+#define PIN_LEFT        19  // 左
+#define PIN_SQUARE      20  // □
+#define PIN_CROSS       21  // ×
+
+// ESP-NOW数据结构
+typedef struct {
+    int lx;         // 左摇杆X轴
+    int ly;         // 左摇杆Y轴
+    int rx;         // 右摇杆X轴
+    int ry;         // 右摇杆Y轴
+    uint16_t buttons; // 按钮状态位图
+} esp_now_data_t;
+
+// 按钮位图定义
+#define BTN_UP      0x0001
+#define BTN_DOWN    0x0002
+#define BTN_LEFT    0x0004
+#define BTN_RIGHT   0x0008
+#define BTN_TRIANGLE 0x0010
+#define BTN_CIRCLE   0x0020
+#define BTN_CROSS    0x0040
+#define BTN_SQUARE   0x0080
+#define BTN_L1       0x0100
+#define BTN_L2       0x0200
+#define BTN_R1       0x0400
+#define BTN_R2       0x0800
+#define BTN_L3       0x1000
+#define BTN_R3       0x2000
+
+// 广播MAC地址
+uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+esp_now_data_t remoteData;
+esp_now_peer_info_t peerInfo;
+
+unsigned long lastSendTime = 0;
+const long sendInterval = 50; // 发送间隔(ms)
+
+void setup() {
+    Serial.begin(115200);
+    
+    // 设置模拟输入引脚
+    pinMode(PIN_LSTICK_X, INPUT);
+    pinMode(PIN_LSTICK_Y, INPUT);
+    pinMode(PIN_RSTICK_X, INPUT);
+    pinMode(PIN_RSTICK_Y, INPUT);
+    
+    // 设置ADC精度和衰减
+    analogReadResolution(12);  // 12位精度(0-4095)
+    analogSetAttenuation(ADC_11db);  // 3.3V参考电压
+    
+    // 初始化数字输入引脚
+    pinMode(PIN_L1, INPUT_PULLUP);
+    pinMode(PIN_L2, INPUT_PULLUP);
+    pinMode(PIN_R1, INPUT_PULLUP);
+    pinMode(PIN_R2, INPUT_PULLUP);
+    pinMode(PIN_UP, INPUT_PULLUP);
+    pinMode(PIN_DOWN, INPUT_PULLUP);
+    pinMode(PIN_LEFT, INPUT_PULLUP);
+    pinMode(PIN_RIGHT, INPUT_PULLUP);
+    pinMode(PIN_TRIANGLE, INPUT_PULLUP);
+    pinMode(PIN_CIRCLE, INPUT_PULLUP);
+    pinMode(PIN_CROSS, INPUT_PULLUP);
+    pinMode(PIN_SQUARE, INPUT_PULLUP);
+    pinMode(PIN_L3, INPUT_PULLUP);
+    pinMode(PIN_R3, INPUT_PULLUP);
+    
+    // 初始化ESP-NOW
+    WiFi.mode(WIFI_STA);
+    
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("Error initializing ESP-NOW");
+        return;
+    }
+    
+    // 注册对等节点
+    memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+    peerInfo.channel = 0;  
+    peerInfo.encrypt = false;
+    
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+        Serial.println("Failed to add peer");
+        return;
+    }
+    
+    Serial.println("ESP-NOW Remote Controller Ready");
+}
+
+void loop() {
+    if (millis() - lastSendTime >= sendInterval) {
+        // 读取摇杆值 (0-1023映射到-128~127)
+        remoteData.lx =map(analogRead(PIN_LSTICK_X), 0, 4095, -128, 127);
+        remoteData.ly =(analogRead(PIN_LSTICK_Y), 0, 4095, -128, 127);
+        remoteData.rx =map(analogRead(PIN_RSTICK_X), 0, 4095, -128, 127);
+        remoteData.ry =map(analogRead(PIN_RSTICK_Y), 0, 4095, -128, 127);
+        
+        // 读取按钮状态
+        remoteData.buttons = 0;
+        if (digitalRead(PIN_UP) == LOW) remoteData.buttons |= BTN_UP;
+        if (digitalRead(PIN_DOWN) == LOW) remoteData.buttons |= BTN_DOWN;
+        if (digitalRead(PIN_LEFT) == LOW) remoteData.buttons |= BTN_LEFT;
+        if (digitalRead(PIN_RIGHT) == LOW) remoteData.buttons |= BTN_RIGHT;
+        if (digitalRead(PIN_TRIANGLE) == LOW) remoteData.buttons |= BTN_TRIANGLE;
+        if (digitalRead(PIN_CIRCLE) == LOW) remoteData.buttons |= BTN_CIRCLE;
+        if (digitalRead(PIN_CROSS) == LOW) remoteData.buttons |= BTN_CROSS;
+        if (digitalRead(PIN_SQUARE) == LOW) remoteData.buttons |= BTN_SQUARE;
+        if (digitalRead(PIN_L1) == LOW) remoteData.buttons |= BTN_L1;
+        if (digitalRead(PIN_L2) == LOW) remoteData.buttons |= BTN_L2;
+        if (digitalRead(PIN_R1) == LOW) remoteData.buttons |= BTN_R1;
+        if (digitalRead(PIN_R2) == LOW) remoteData.buttons |= BTN_R2;
+        if (digitalRead(PIN_L3) == LOW) remoteData.buttons |= BTN_L3;
+        if (digitalRead(PIN_R3) == LOW) remoteData.buttons |= BTN_R3;
+        
+        // 发送数据
+        esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *) &remoteData, sizeof(remoteData));
+        
+        if (result == ESP_OK) {
+            // Serial.println("Send success");
+        } else {
+            Serial.println("Send error");
+        }
+        
+        lastSendTime = millis();
+    }
+}

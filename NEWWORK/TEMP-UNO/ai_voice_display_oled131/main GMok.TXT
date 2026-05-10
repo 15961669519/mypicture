@@ -1,0 +1,1490 @@
+#include <Arduino.h>
+#include <driver/i2c_master.h>
+#include <esp_lcd_io_i2c.h>
+#include <esp_lcd_panel_ops.h>
+#include <esp_lcd_panel_ssd1306.h>
+#include <WiFiManager.h>
+#include <algorithm>
+#include <memory>
+#include <cstdio>
+#include <vector>
+#include <string>
+#include <sstream>
+
+#include "ai_vox_engine.h"
+#include "audio_device/audio_input_device_i2s_std.h"
+#include "audio_device/audio_input_device_pdm.h"
+#include "audio_device/audio_output_device_i2s_std.h"
+#include "components/espressif/esp_audio_codec/esp_audio_simple_dec.h"
+#include "components/espressif/esp_audio_codec/esp_mp3_dec.h"
+#include "display.h"
+
+#ifndef ARDUINO_ESP32_DEV
+#error "This example only supports ESP32-Dev board."
+#endif
+
+#define AUDIO_INPUT_DEVICE_TYPE_PDM (0)
+#define AUDIO_INPUT_DEVICE_TYPE_I2S_STD (1)
+#define AUDIO_INPUT_DEVICE_TYPE AUDIO_INPUT_DEVICE_TYPE_I2S_STD
+// #define AUDIO_INPUT_DEVICE_TYPE AUDIO_INPUT_DEVICE_TYPE_PDM
+
+// 配网状态机
+enum class WiFiConfigState {
+  IDLE,
+  CHECKING_BUTTON,
+  CONFIG_PORTAL,
+  CONNECTED
+};
+
+// ============================================================
+// 任务管理相关数据结构
+// ============================================================
+
+// 单个定时提醒任务
+struct TimedReminder {
+  unsigned long trigger_time_ms;  // 触发时刻（millis()）
+  std::string reminder_text;      // 提醒内容，如"该喝水啦"
+  bool fired;                     // 是否已触发
+};
+
+// 顺序播报任务（先...后...再...）
+struct SequentialTask {
+  std::vector<std::string> messages;  // 需要依次播报的消息列表
+  size_t current_index;               // 当前已播报到的索引
+  unsigned long next_send_time_ms;    // 下一条消息的发送时刻
+  bool active;                        // 任务是否激活
+};
+
+namespace {
+// 麦克风引脚配置
+#if AUDIO_INPUT_DEVICE_TYPE == AUDIO_INPUT_DEVICE_TYPE_I2S_STD
+// I2S standard interface
+constexpr gpio_num_t kMicPinSck = GPIO_NUM_26;  // SCK (BCK, BCLK): Serial-Data Clock for I²S Interface
+constexpr gpio_num_t kMicPinWs = GPIO_NUM_25;   // WS (WR, WCLK): Serial Data-Word Select for I²S Interface
+constexpr gpio_num_t kMicPinSd = GPIO_NUM_27;   // SD (DIN，DOUT, DI, DO, DATA): Serial-Data Output for I²S Interface
+#elif AUDIO_INPUT_DEVICE_TYPE == AUDIO_INPUT_DEVICE_TYPE_PDM
+// PDM interface
+constexpr gpio_num_t kMicPinSck = GPIO_NUM_12;  // SCK (BCK, BCLK): Serial-Data Clock for I²S Interface
+constexpr gpio_num_t kMicPinSd = GPIO_NUM_13;   // SD (DIN，DOUT, DI, DO, DATA): Serial-Data Output for I²S Interface
+#endif
+
+// 扬声器引脚配置
+constexpr gpio_num_t kSpeakerPinSck = GPIO_NUM_16;  // SCK (BCK, BCLK): Serial-Data Clock for I²S Interface
+constexpr gpio_num_t kSpeakerPinWs = GPIO_NUM_15;   // WS (WR, WCLK): Serial Data-Word Select for I²S Interface
+constexpr gpio_num_t kSpeakerPinSd = GPIO_NUM_17;   // SD (DIN，DOUT, DI, DO, DATA): Serial-Data Output for I²S Interface
+
+constexpr gpio_num_t kI2cPinSda = GPIO_NUM_21;
+constexpr gpio_num_t kI2cPinScl = GPIO_NUM_22;
+
+constexpr gpio_num_t kTriggerPin = GPIO_NUM_35;  // 按钮引脚，用于触发配网和语音识别
+constexpr gpio_num_t kLedPin = GPIO_NUM_2;
+
+// 与Arduino UNO通信的串口引脚
+constexpr gpio_num_t kUnoTxPin = GPIO_NUM_13;  // ESP32 TX -> UNO RX (引脚4)
+constexpr gpio_num_t kUnoRxPin = GPIO_NUM_14;  // ESP32 RX -> UNO TX (引脚3)
+
+constexpr uint32_t kDisplayWidth = 128;
+constexpr uint32_t kDisplayHeight = 64;
+constexpr bool kDisplayMirrorX = true;
+constexpr bool kDisplayMirrorY = true;
+
+std::unique_ptr<Display> g_display;
+auto g_observer = std::make_shared<ai_vox::Observer>();
+auto g_audio_output_device = std::make_shared<ai_vox::AudioOutputDeviceI2sStd>(kSpeakerPinSck, kSpeakerPinWs, kSpeakerPinSd);
+
+// 配网相关变量
+WiFiConfigState g_wifi_config_state = WiFiConfigState::IDLE;
+unsigned long g_config_start_time = 0;
+constexpr unsigned long kConfigCheckInterval = 50;
+constexpr unsigned long kConfigButtonPressTime = 5000;  // 5秒长按进入配网
+constexpr unsigned long kConfigPortalTimeout = 180000;  // 3分钟配网超时
+WiFiManager *g_wifiManager = nullptr;
+
+// AI引擎状态相关
+bool g_ai_engine_started = false;
+unsigned long g_engine_start_time = 0;
+constexpr unsigned long kEngineRetryDelay = 10000; // 10秒后重试
+constexpr int kMaxEngineRetries = 3; // 最多重试3次
+int g_engine_retry_count = 0;
+bool g_engine_needs_restart = false;
+
+// 记录当前AI引擎状态
+ai_vox::ChatState g_current_chat_state = ai_vox::ChatState::kIdle;
+
+// 文本发送队列
+std::vector<std::string> g_text_queue;
+
+// 会话ID
+std::string g_session_id;
+
+// Arduino UNO通信相关变量
+HardwareSerial unoSerial(2); // 使用Serial2
+bool unoConnected = false;
+
+// ============================================================
+// 任务管理全局变量
+// ============================================================
+std::vector<TimedReminder> g_timed_reminders;   // 定时提醒列表（支持多条并行）
+SequentialTask g_sequential_task;               // 当前顺序播报任务
+constexpr unsigned long kSequentialIntervalMs = 1000; // 顺序播报间隔1秒
+
+// 构建JSON消息的辅助函数
+std::string BuildListenMessage(const std::string& text, const std::string& state = "detect") {
+  if (g_session_id.empty()) {
+    printf("警告: session_id为空，无法构建消息\n");
+    return "";
+  }
+  
+  std::stringstream ss;
+  ss << "{";
+  ss << "\"session_id\":\"" << g_session_id << "\",";
+  ss << "\"type\":\"listen\",";
+  ss << "\"state\":\"" << state << "\",";
+  ss << "\"text\":\"" << text << "\"";
+  ss << "}";
+  return ss.str();
+}
+
+// 简化的JSON解析函数，提取session_id
+bool ExtractSessionId(const std::string& json_str) {
+  size_t pos = json_str.find("\"session_id\":");
+  if (pos == std::string::npos) {
+    return false;
+  }
+  pos += 13;
+  while (pos < json_str.length() && (json_str[pos] == ' ' || json_str[pos] == '\t' || json_str[pos] == '\n' || json_str[pos] == '\r')) {
+    pos++;
+  }
+  if (pos >= json_str.length() || json_str[pos] != '"') {
+    return false;
+  }
+  pos++;
+  size_t end = json_str.find('"', pos);
+  if (end == std::string::npos) {
+    return false;
+  }
+  g_session_id = json_str.substr(pos, end - pos);
+  printf("提取到session_id: %s\n", g_session_id.c_str());
+  return true;
+}
+
+// 检查是否是hello消息
+bool IsHelloMessage(const std::string& json_str) {
+  return json_str.find("\"type\":\"hello\"") != std::string::npos ||
+         json_str.find("\"type\": \"hello\"") != std::string::npos ||
+         json_str.find("'type':'hello'") != std::string::npos;
+}
+
+// 主动发送文本的方法
+bool TrySendText(const std::string& text) {
+  if (!g_ai_engine_started) {
+    printf("AI引擎未启动，无法发送文本\n");
+    return false;
+  }
+  
+  if (g_session_id.empty()) {
+    printf("session_id为空，无法发送文本\n");
+    return false;
+  }
+  
+  auto& engine = ai_vox::Engine::GetInstance();
+  
+  printf("尝试发送文本: %s\n", text.c_str());
+  printf("当前状态: %d\n", static_cast<int>(g_current_chat_state));
+  
+  switch (g_current_chat_state) {
+    case ai_vox::ChatState::kListening: {
+      printf("状态适合发送文本\n");
+      std::string json_message = BuildListenMessage(text);
+      if (json_message.empty()) {
+        printf("无法构建JSON消息\n");
+        return false;
+      }
+      printf("发送JSON消息: %s\n", json_message.c_str());
+      engine.SendText(json_message);
+      g_display->ShowStatus("发送文本中");
+      g_display->SetChatMessage("用户: " + text);
+      printf("文本消息已发送\n");
+      return true;
+    }
+
+    case ai_vox::ChatState::kStandby: {
+      // 待命状态自动推进到聆听，下次循环再重试发送
+      printf("待命状态，自动推进至聆听...\n");
+      engine.Advance();
+      return false;
+    }
+    
+    case ai_vox::ChatState::kIdle:
+    case ai_vox::ChatState::kConnecting: {
+      printf("当前状态不适合发送文本: %d\n", static_cast<int>(g_current_chat_state));
+      printf("尝试激活引擎...\n");
+      engine.Advance();
+      delay(100);
+      printf("等待状态变化后重试...\n");
+      return false;
+    }
+    
+    case ai_vox::ChatState::kSpeaking: {
+      printf("当前正在说话中，等待结束后重试...\n");
+      return false;
+    }
+    
+    default: {
+      printf("未知状态: %d\n", static_cast<int>(g_current_chat_state));
+      return false;
+    }
+  }
+}
+
+// 【修改后的发送队列处理函数】
+void ProcessTextQueue() {
+  if (g_text_queue.empty() || !g_ai_engine_started) {
+    return;
+  }
+  
+  // 增加统一的频率控制：无论是成功还是失败，每次尝试都间隔 1000 毫秒
+  static unsigned long last_try_time = 0;
+  if (millis() - last_try_time < 1000) {
+    return;
+  }
+
+  std::string text = g_text_queue.front();
+  
+  printf("处理文本队列中的文本: %s\n", text.c_str());
+  
+  if (TrySendText(text)) {
+    printf("成功发送文本: %s\n", text.c_str());
+    // 只有发送成功，才将消息从队列前端移除
+    g_text_queue.erase(g_text_queue.begin());
+    last_try_time = millis(); 
+  } else {
+    printf("发送文本失败，将在队列中等待重试: %s\n", text.c_str());
+    // 发送失败时不移除元素，等待 loop 下次重试，并更新尝试时间，防止疯狂重试
+    last_try_time = millis();
+  }
+}
+
+// 初始化与UNO的串口通信
+void InitUnoCommunication() {
+  Serial.println("初始化UNO串口通信");
+  unoSerial.begin(9600, SERIAL_8N1, kUnoRxPin, kUnoTxPin);
+  unoSerial.setTimeout(100);
+  delay(100);
+  unoSerial.print("TEST:ESP32_CONNECTED\n");
+  delay(100);
+  unoConnected = true;
+  Serial.println("UNO串口已初始化");
+  g_display->ShowStatus("UNO已连接");
+}
+
+// 辅助函数：获取UTF-8字符的字节长度
+int getUtf8CharLength(unsigned char firstByte) {
+  if ((firstByte & 0x80) == 0x00) return 1;
+  else if ((firstByte & 0xE0) == 0xC0) return 2;
+  else if ((firstByte & 0xF0) == 0xE0) return 3;
+  else if ((firstByte & 0xF8) == 0xF0) return 4;
+  return 1;
+}
+
+// 处理从UNO接收到的文本消息
+void ProcessUnoMessages() {
+  if (!unoConnected) {
+    return;
+  }
+  
+  while (unoSerial.available() > 0) {
+    String line = unoSerial.readStringUntil('\n');
+    line.trim();
+    
+    if (line.length() > 0) {
+      Serial.print("从UNO接收到: ");
+      Serial.println(line);
+      
+      if (line.startsWith("播报")) {
+        const char* line_cstr = line.c_str();
+        size_t line_len = line.length();
+        
+        if (line_len >= 6) {
+          std::string text;
+          for (size_t i = 6; i < line_len; i++) {
+            text.push_back(line_cstr[i]);
+          }
+          
+          if (!text.empty()) {
+            Serial.print("将处理后的文本添加到队列: ");
+            Serial.println(text.c_str());
+            g_text_queue.push_back(text);
+            // 移除了这里的 ProcessTextQueue(); 由 loop 统一调度
+          } else {
+            Serial.println("警告：提取的文本为空");
+          }
+        } else {
+          Serial.println("警告：接收到的文本太短，无法跳过'播报'前缀");
+        }
+      }
+      else if (line.startsWith("UNO:")) {
+        if (line.indexOf("READY") != -1) {
+          Serial.println("UNO报告已就绪");
+          g_display->ShowStatus("UNO已就绪");
+        }
+      }
+      else {
+        Serial.print("收到其他UNO消息: ");
+        Serial.println(line);
+      }
+    }
+  }
+}
+
+// 辅助函数：获取中文字符的字节长度
+size_t getChineseCharLength(const std::string& str, size_t start_pos) {
+  if (start_pos >= str.length()) return 0;
+  
+  unsigned char first_byte = static_cast<unsigned char>(str[start_pos]);
+  
+  if ((first_byte & 0xE0) == 0xE0) {
+    if (start_pos + 2 < str.length()) {
+      unsigned char second_byte = static_cast<unsigned char>(str[start_pos + 1]);
+      unsigned char third_byte = static_cast<unsigned char>(str[start_pos + 2]);
+      
+      if ((second_byte & 0xC0) == 0x80 && (third_byte & 0xC0) == 0x80) {
+        return 3;
+      }
+    }
+  }
+  
+  return 1;
+}
+
+// 处理"马上"命令
+void processMashangCommand(const std::string& content) {
+  std::string mashang = "马上";
+  size_t mashangPos = content.find(mashang);
+  if (mashangPos == std::string::npos) {
+    return;
+  }
+  
+  Serial.print("检测到'马上'命令: ");
+  Serial.println(content.c_str());
+  
+  size_t mashangBytes = 6;
+  size_t verbStartPos = mashangPos + mashangBytes;
+  
+  if (verbStartPos >= content.length()) {
+    Serial.println("命令内容不足，无法提取动词");
+    return;
+  }
+  
+  std::string verb;
+  size_t verbBytes = 0;
+  
+  size_t char1Len = getChineseCharLength(content, verbStartPos);
+  if (char1Len == 3) {
+    verb = content.substr(verbStartPos, 3);
+    verbBytes += 3;
+    
+    size_t char2StartPos = verbStartPos + 3;
+    if (char2StartPos < content.length()) {
+      size_t char2Len = getChineseCharLength(content, char2StartPos);
+      if (char2Len == 3) {
+        verb += content.substr(char2StartPos, 3);
+        verbBytes += 3;
+      } else {
+        Serial.println("警告：动词第二个字符不是有效的中文字符");
+        return;
+      }
+    } else {
+      Serial.println("命令长度不足，无法提取双字动词");
+      return;
+    }
+  } else {
+    Serial.println("动词第一个字符不是有效的中文字符");
+    return;
+  }
+  
+  size_t nounStartPos = verbStartPos + verbBytes;
+  std::string noun;
+  
+  if (nounStartPos < content.length()) {
+    noun = content.substr(nounStartPos);
+    
+    const std::string punctuations = "。，！？.?!;";
+    while (!noun.empty()) {
+      size_t lastCharLen = getChineseCharLength(noun, noun.length() - 1);
+      std::string lastChar = noun.substr(noun.length() - lastCharLen);
+      
+      if (punctuations.find(lastChar) != std::string::npos) {
+        noun = noun.substr(0, noun.length() - lastCharLen);
+      } else {
+        break;
+      }
+    }
+    
+    noun.erase(std::remove_if(noun.begin(), noun.end(), ::isspace), noun.end());
+  }
+  
+  Serial.print("解析结果 -> 动词: ");
+  Serial.print(verb.c_str());
+  Serial.print(", 名词: ");
+  Serial.println(noun.c_str());
+  
+  if (!unoConnected) {
+    Serial.println("UNO未连接，无法发送命令");
+    g_display->ShowStatus("UNO未连接");
+    return;
+  }
+  
+  Serial.println("开始发送完整命令序列到UNO");
+  
+  std::string startMsg = "CMD_START\n";
+  unoSerial.print(startMsg.c_str());
+  delay(10);
+  Serial.println("发送: CMD_START");
+  
+  if (!verb.empty()) {
+    std::string verbMsg = "VERB:" + verb + "\n";
+    unoSerial.print(verbMsg.c_str());
+    delay(10);
+    Serial.print("发送动词: ");
+    Serial.println(verb.c_str());
+  } else {
+    Serial.println("警告：动词为空");
+  }
+  
+  if (!noun.empty()) {
+    std::string nounMsg = "NOUN:" + noun + "\n";
+    unoSerial.print(nounMsg.c_str());
+    delay(10);
+    Serial.print("发送名词: ");
+    Serial.println(noun.c_str());
+  } else {
+    std::string nounMsg = "NOUN:\n";
+    unoSerial.print(nounMsg.c_str());
+    delay(10);
+    Serial.println("发送空名词");
+  }
+  
+  std::string endMsg = "CMD_END\n";
+  unoSerial.print(endMsg.c_str());
+  delay(10);
+  Serial.println("发送: CMD_END");
+  
+  Serial.println("完整命令序列发送完成");
+  
+  std::string displayMsg = "发送: " + verb;
+  if (!noun.empty()) {
+    displayMsg += "->" + noun;
+  }
+  g_display->ShowStatus(displayMsg.c_str());
+}
+
+// ============================================================
+// 任务管理：辅助函数
+// ============================================================
+
+// 将UTF-8字符串分割为单个字符（中文3字节，ASCII 1字节）
+std::vector<std::string> SplitUtf8Chars(const std::string& s) {
+  std::vector<std::string> chars;
+  size_t i = 0;
+  while (i < s.length()) {
+    int len = getUtf8CharLength(static_cast<unsigned char>(s[i]));
+    if (i + len <= s.length()) {
+      chars.push_back(s.substr(i, len));
+    }
+    i += len;
+  }
+  return chars;
+}
+
+// 将字符串按关键词分割，返回各段
+std::vector<std::string> SplitByKeyword(const std::string& s, const std::string& keyword) {
+  std::vector<std::string> parts;
+  size_t start = 0;
+  size_t pos;
+  while ((pos = s.find(keyword, start)) != std::string::npos) {
+    if (pos > start) {
+      parts.push_back(s.substr(start, pos - start));
+    }
+    start = pos + keyword.length();
+  }
+  if (start < s.length()) {
+    parts.push_back(s.substr(start));
+  }
+  return parts;
+}
+
+// 去除字符串首尾空白及常见标点
+std::string TrimPunctuation(const std::string& s) {
+  const std::string puncts_bytes = "。，！？.?!;、 \t\r\n";
+  std::string result = s;
+  // 简单从末尾裁剪单字节标点
+  while (!result.empty()) {
+    char last = result.back();
+    if (last == '.' || last == ',' || last == '!' || last == '?' || last == ';'
+        || last == ' ' || last == '\t' || last == '\r' || last == '\n') {
+      result.pop_back();
+    } else {
+      // 检查多字节中文标点（3字节）
+      if (result.length() >= 3) {
+        std::string tail3 = result.substr(result.length() - 3);
+        if (tail3 == "。" || tail3 == "，" || tail3 == "！" || tail3 == "？" || tail3 == "、") {
+          result = result.substr(0, result.length() - 3);
+          continue;
+        }
+      }
+      break;
+    }
+  }
+  // 去首部空白
+  size_t start = 0;
+  while (start < result.length() && (result[start] == ' ' || result[start] == '\t')) {
+    start++;
+  }
+  return result.substr(start);
+}
+
+// ============================================================
+// 解析时间字符串，返回毫秒数；失败返回0
+// 支持格式：
+//   "X分Y秒"  "X分钟Y秒"  "X分"  "X分钟"
+//   "Y秒"     纯数字（秒）
+// ============================================================
+unsigned long ParseTimeToMs(const std::string& time_str) {
+  unsigned long minutes = 0;
+  unsigned long seconds = 0;
+  bool parsed = false;
+
+  // 尝试找"分"
+  size_t fen_pos = time_str.find("分");
+  if (fen_pos == std::string::npos) {
+    fen_pos = time_str.find("分钟");
+  }
+
+  if (fen_pos != std::string::npos) {
+    // 提取分钟数字
+    std::string min_str;
+    for (int i = (int)fen_pos - 1; i >= 0; i--) {
+      char c = time_str[i];
+      if (c >= '0' && c <= '9') {
+        min_str = c + min_str;
+      } else {
+        break;
+      }
+    }
+    if (!min_str.empty()) {
+      minutes = (unsigned long)atol(min_str.c_str());
+      parsed = true;
+    }
+
+    // 尝试找"秒"（在"分"之后）
+    size_t miao_start = fen_pos + 3; // 跳过"分"（3字节）
+    // 如果是"分钟"要跳过6字节
+    if (time_str.substr(fen_pos, 6) == "分钟") {
+      miao_start = fen_pos + 6;
+    }
+    size_t miao_pos = time_str.find("秒", miao_start);
+    if (miao_pos != std::string::npos) {
+      std::string sec_str;
+      for (int i = (int)miao_pos - 1; i >= (int)miao_start; i--) {
+        char c = time_str[i];
+        if (c >= '0' && c <= '9') {
+          sec_str = c + sec_str;
+        } else {
+          break;
+        }
+      }
+      if (!sec_str.empty()) {
+        seconds = (unsigned long)atol(sec_str.c_str());
+        parsed = true;
+      }
+    }
+  } else {
+    // 没有"分"，只有"秒"或纯数字
+    size_t miao_pos = time_str.find("秒");
+    if (miao_pos != std::string::npos) {
+      std::string sec_str;
+      for (int i = (int)miao_pos - 1; i >= 0; i--) {
+        char c = time_str[i];
+        if (c >= '0' && c <= '9') {
+          sec_str = c + sec_str;
+        } else {
+          break;
+        }
+      }
+      if (!sec_str.empty()) {
+        seconds = (unsigned long)atol(sec_str.c_str());
+        parsed = true;
+      }
+    } else {
+      // 纯数字（秒）
+      bool all_digits = !time_str.empty();
+      for (char c : time_str) {
+        if (c < '0' || c > '9') { all_digits = false; break; }
+      }
+      if (all_digits) {
+        seconds = (unsigned long)atol(time_str.c_str());
+        parsed = true;
+      }
+    }
+  }
+
+  if (!parsed) return 0;
+  return (minutes * 60 + seconds) * 1000UL;
+}
+
+// ============================================================
+// 解析用户语音文本，尝试识别任务类型并创建任务
+// 返回 true 表示识别到任务并已创建
+// ============================================================
+
+// 判断字符串是否包含某中文子串
+bool ContainsCN(const std::string& s, const std::string& kw) {
+  return s.find(kw) != std::string::npos;
+}
+
+// ============================================================
+// 解析定时提醒，支持多任务（如"1分30秒后喝水，2分钟后跑步"）
+// 格式：<时间>后<动作>，可用逗号/顿号/空格分隔多个任务
+// 返回成功添加的任务数量
+// ============================================================
+int ParseTimedReminders(const std::string& user_text) {
+  // 定位"后"字，逐段解析
+  // 先按常见分隔符拆分（逗号、顿号、"然后"等）
+  // 然后对每段检测 <时间>后<动作>
+
+  // 将整句按"，"/"，"/空格/顿号分段
+  std::string text = user_text;
+  // 统一替换分隔符为ASCII逗号便于处理（不影响中文字）
+  // 注意：中文逗号为3字节 E3 80 81 / EF BC 8C，直接用find即可
+
+  // 收集所有候选片段
+  std::vector<std::string> segments;
+  // 先用"，"分割
+  {
+    size_t start = 0;
+    const std::string sep1 = "，";  // 中文逗号
+    const std::string sep2 = "、";  // 顿号
+    size_t pos;
+    std::string cur = text;
+    // 逐个中文分隔符查找
+    bool found = true;
+    while (found) {
+      found = false;
+      size_t p1 = cur.find(sep1, start);
+      size_t p2 = cur.find(sep2, start);
+      size_t p = std::string::npos;
+      size_t sep_len = 3;
+      if (p1 != std::string::npos && (p2 == std::string::npos || p1 <= p2)) {
+        p = p1; sep_len = 3;
+      } else if (p2 != std::string::npos) {
+        p = p2; sep_len = 3;
+      }
+      if (p != std::string::npos) {
+        segments.push_back(cur.substr(start, p - start));
+        start = p + sep_len;
+        found = true;
+      }
+    }
+    if (start < cur.length()) {
+      segments.push_back(cur.substr(start));
+    }
+  }
+
+  if (segments.empty()) {
+    segments.push_back(text);
+  }
+
+  int count = 0;
+  for (auto& seg : segments) {
+    seg = TrimPunctuation(seg);
+    if (seg.empty()) continue;
+
+    // 查找"后"字（中文3字节）
+    size_t hou_pos = seg.find("后");
+    if (hou_pos == std::string::npos) continue;
+
+    // "后"前面是时间，后面是动作
+    std::string time_part = seg.substr(0, hou_pos);
+    std::string action_part = seg.substr(hou_pos + 3); // 跳过"后"3字节
+    action_part = TrimPunctuation(action_part);
+
+    if (time_part.empty() || action_part.empty()) continue;
+
+    unsigned long delay_ms = ParseTimeToMs(time_part);
+    if (delay_ms == 0) continue; // 无法解析时间，跳过
+
+    // 构造提醒文本：该<动作>啦
+    std::string reminder = "该" + action_part + "啦";
+    unsigned long trigger = millis() + delay_ms;
+
+    TimedReminder tr;
+    tr.trigger_time_ms = trigger;
+    tr.reminder_text = reminder;
+    tr.fired = false;
+    g_timed_reminders.push_back(tr);
+
+    printf("添加定时提醒: %s, %lu ms后触发\n", reminder.c_str(), delay_ms);
+    count++;
+  }
+  return count;
+}
+
+// ============================================================
+// 解析顺序播报任务
+// 支持：先<动词><设备>后<动词><设备>再<动词><设备>...
+// 动词识别：开、关（单字）
+// 每条消息格式：打开<设备> 或 关闭<设备>
+// ============================================================
+bool ParseSequentialTask(const std::string& user_text) {
+  // 必须包含"先"才考虑顺序任务
+  if (!ContainsCN(user_text, "先")) return false;
+
+  // 用"先"/"后"/"再"/"然后"作为分隔符拆分步骤
+  // 每步格式：<动词><设备>
+  const std::vector<std::string> delimiters = {"先", "后", "再", "然后"};
+
+  std::vector<std::string> steps;
+  std::string text = user_text;
+  size_t pos = 0;
+
+  // 逐字符扫描，遇到分隔词则切分
+  while (pos < text.length()) {
+    // 检查当前位置是否是分隔词
+    bool is_delim = false;
+    size_t delim_len = 0;
+    for (const auto& d : delimiters) {
+      if (text.substr(pos, d.length()) == d) {
+        is_delim = true;
+        delim_len = d.length();
+        break;
+      }
+    }
+
+    if (is_delim) {
+      pos += delim_len;
+      // 读取到下一个分隔词之前的内容作为一个步骤
+      size_t step_start = pos;
+      size_t next_delim = text.length();
+      for (const auto& d : delimiters) {
+        size_t np = text.find(d, pos);
+        if (np != std::string::npos && np < next_delim) {
+          next_delim = np;
+        }
+      }
+      std::string step = TrimPunctuation(text.substr(step_start, next_delim - step_start));
+      if (!step.empty()) {
+        steps.push_back(step);
+      }
+      pos = next_delim;
+    } else {
+      // 跳过当前字符
+      int cl = getUtf8CharLength(static_cast<unsigned char>(text[pos]));
+      pos += cl;
+    }
+  }
+
+  if (steps.empty()) return false;
+
+  // 解析每一步：动词 + 设备名
+  std::vector<std::string> messages;
+  for (const auto& step : steps) {
+    if (step.empty()) continue;
+
+    // 取第一个中文字符为动词
+    int verb_len = getUtf8CharLength(static_cast<unsigned char>(step[0]));
+    std::string verb_char = step.substr(0, verb_len);
+    std::string device = step.substr(verb_len);
+    device = TrimPunctuation(device);
+
+    std::string action_word;
+    if (verb_char == "开") {
+      action_word = "打开";
+    } else if (verb_char == "关") {
+      action_word = "关闭";
+    } else {
+      // 尝试双字动词
+      if (step.length() >= 6) {
+        int verb2_len = getUtf8CharLength(static_cast<unsigned char>(step[verb_len]));
+        std::string verb2_char = step.substr(0, verb_len + verb2_len);
+        device = step.substr(verb_len + verb2_len);
+        device = TrimPunctuation(device);
+        if (verb2_char == "打开" || verb2_char == "开启") {
+          action_word = "打开";
+        } else if (verb2_char == "关闭" || verb2_char == "关掉") {
+          action_word = "关闭";
+        } else {
+          action_word = verb2_char; // 原样保留
+        }
+      } else {
+        action_word = verb_char;
+      }
+    }
+
+    if (!device.empty()) {
+      messages.push_back(action_word + device);
+    }
+  }
+
+  if (messages.empty()) return false;
+
+  // 初始化顺序任务
+  g_sequential_task.messages = messages;
+  g_sequential_task.current_index = 0;
+  g_sequential_task.next_send_time_ms = millis(); // 立即开始
+  g_sequential_task.active = true;
+
+  printf("创建顺序任务，共%d步\n", (int)messages.size());
+  for (size_t i = 0; i < messages.size(); i++) {
+    printf("  步骤%d: %s\n", (int)(i + 1), messages[i].c_str());
+  }
+  return true;
+}
+
+// ============================================================
+// 统一入口：尝试解析用户文本为任务
+// 返回 true 表示识别并创建了任务（此时不必再发给AI处理）
+// ============================================================
+bool TryParseAndCreateTask(const std::string& user_text) {
+  // 优先尝试顺序任务（含"先"）
+  if (ContainsCN(user_text, "先")) {
+    if (ParseSequentialTask(user_text)) {
+      printf("识别到顺序任务\n");
+      g_display->ShowStatus("顺序任务已创建");
+      // 给用户反馈（直接发到AI回复队列，但不再把原始请求发给AI）
+      return true;
+    }
+  }
+
+  // 尝试定时提醒（含"后"）
+  if (ContainsCN(user_text, "后")) {
+    int n = ParseTimedReminders(user_text);
+    if (n > 0) {
+      printf("识别到%d个定时提醒\n", n);
+      char buf[64];
+      snprintf(buf, sizeof(buf), "已设置%d个提醒", n);
+      g_display->ShowStatus(buf);
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// ============================================================
+// 在 loop() 中调用：检查并触发定时提醒
+// ============================================================
+void ProcessTimedReminders() {
+  unsigned long now = millis();
+  for (auto& tr : g_timed_reminders) {
+    if (!tr.fired && now >= tr.trigger_time_ms) {
+      tr.fired = true;
+      printf("触发定时提醒: %s\n", tr.reminder_text.c_str());
+      g_text_queue.push_back(tr.reminder_text);
+      g_display->ShowStatus(tr.reminder_text.c_str());
+      // 移除了这里的 ProcessTextQueue(); 由 loop 统一调度
+    }
+  }
+  // 清理已触发的提醒
+  g_timed_reminders.erase(
+    std::remove_if(g_timed_reminders.begin(), g_timed_reminders.end(),
+      [](const TimedReminder& r) { return r.fired; }),
+    g_timed_reminders.end()
+  );
+}
+
+// ============================================================
+// 在 loop() 中调用：驱动顺序播报任务
+// ============================================================
+void ProcessSequentialTask() {
+  if (!g_sequential_task.active) return;
+
+  unsigned long now = millis();
+  if (now < g_sequential_task.next_send_time_ms) return;
+
+  // 检查AI是否处于可发送状态
+  if (g_current_chat_state == ai_vox::ChatState::kSpeaking) {
+    // 正在说话，稍后再试
+    g_sequential_task.next_send_time_ms = now + 200;
+    return;
+  }
+
+  if (g_sequential_task.current_index < g_sequential_task.messages.size()) {
+    const std::string& msg = g_sequential_task.messages[g_sequential_task.current_index];
+    printf("顺序任务发送第%d步: %s\n", (int)(g_sequential_task.current_index + 1), msg.c_str());
+
+    g_text_queue.push_back(msg);
+    // 移除了这里的 ProcessTextQueue(); 由 loop 统一调度
+
+    g_sequential_task.current_index++;
+    // 下一条消息等待1秒（这里可以保留辅助调度，确保入队不会过快）
+    g_sequential_task.next_send_time_ms = now + kSequentialIntervalMs;
+  } else {
+    // 所有步骤完成
+    g_sequential_task.active = false;
+    printf("顺序任务全部完成\n");
+    g_display->ShowStatus("顺序任务完成");
+  }
+}
+
+// ============================================================
+// 原有 Display / WiFi / AI Engine / Button 初始化函数（保持不变）
+// ============================================================
+
+void InitDisplay() {
+  printf("init display\n");
+  i2c_master_bus_handle_t display_i2c_bus;
+  i2c_master_bus_config_t bus_config = {
+      .i2c_port = I2C_NUM_0,
+      .sda_io_num = kI2cPinSda,
+      .scl_io_num = kI2cPinScl,
+      .clk_source = I2C_CLK_SRC_DEFAULT,
+      .glitch_ignore_cnt = 7,
+      .intr_priority = 0,
+      .trans_queue_depth = 0,
+      .flags =
+          {
+              .enable_internal_pullup = 1,
+              .allow_pd = false,
+          },
+  };
+  ESP_ERROR_CHECK(i2c_new_master_bus(&bus_config, &display_i2c_bus));
+
+  esp_lcd_panel_io_handle_t panel_io = nullptr;
+  esp_lcd_panel_io_i2c_config_t io_config = {
+      .dev_addr = 0x3C,
+      .on_color_trans_done = nullptr,
+      .user_ctx = nullptr,
+      .control_phase_bytes = 1,
+      .dc_bit_offset = 6,
+      .lcd_cmd_bits = 8,
+      .lcd_param_bits = 8,
+      .flags =
+          {
+              .dc_low_on_data = 0,
+              .disable_control_phase = 0,
+          },
+      .scl_speed_hz = 400 * 1000,
+  };
+  ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c_v2(display_i2c_bus, &io_config, &panel_io));
+
+  esp_lcd_panel_handle_t panel = nullptr;
+  esp_lcd_panel_dev_config_t panel_config = {};
+  panel_config.reset_gpio_num = -1;
+  panel_config.bits_per_pixel = 1;
+
+  esp_lcd_panel_ssd1306_config_t ssd1306_config = {
+      .height = static_cast<uint8_t>(kDisplayHeight),
+  };
+  panel_config.vendor_config = &ssd1306_config;
+
+  ESP_ERROR_CHECK(esp_lcd_new_panel_ssd1306(panel_io, &panel_config, &panel));
+  ESP_ERROR_CHECK(esp_lcd_panel_reset(panel));
+  ESP_ERROR_CHECK(esp_lcd_panel_init(panel));
+  ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel, true));
+  g_display = std::make_unique<Display>(panel_io, panel, kDisplayWidth, kDisplayHeight, kDisplayMirrorX, kDisplayMirrorY);
+  g_display->Start();
+}
+
+bool TestInternetConnection() {
+  printf("Testing internet connection...\n");
+  IPAddress googleDNS;
+  if (WiFi.hostByName("8.8.8.8", googleDNS)) {
+    printf("DNS test passed\n");
+    return true;
+  } else {
+    printf("DNS test failed\n");
+    return false;
+  }
+}
+
+bool TestServerConnection() {
+  printf("Testing server connection...\n");
+  WiFiClient client;
+  if (client.connect("api.tenclass.net", 80, 2000)) {
+    printf("HTTP connection test passed\n");
+    client.stop();
+    return true;
+  } else {
+    printf("HTTP connection test failed\n");
+    return false;
+  }
+}
+
+bool StartAIEngine(std::shared_ptr<ai_vox::AudioInputDeviceI2sStd> audio_input_device) {
+  auto& ai_vox_engine = ai_vox::Engine::GetInstance();
+  
+  if (WiFi.status() != WL_CONNECTED) {
+    printf("WiFi is not connected, cannot start AI engine\n");
+    g_display->ShowStatus("WiFi未连接");
+    return false;
+  }
+  
+  if (!TestInternetConnection()) {
+    printf("Internet connection test failed\n");
+    g_display->ShowStatus("网络连接失败");
+    return false;
+  }
+  
+  if (!TestServerConnection()) {
+    printf("Server connection test failed\n");
+    g_display->ShowStatus("服务器连接失败");
+    return false;
+  }
+  
+  printf("Configuring AI engine...\n");
+  g_display->ShowStatus("配置AI引擎");
+  
+  ai_vox_engine.SetObserver(g_observer);
+  ai_vox_engine.SetOtaUrl("https://api.tenclass.net/xiaozhi/ota/");
+  ai_vox_engine.ConfigWebsocket("wss://api.tenclass.net/xiaozhi/v1/",
+                                {
+                                    {"Authorization", "Bearer test-token"},
+                                });
+  
+  printf("Starting AI engine...\n");
+  g_display->ShowStatus("AI引擎启动中");
+  
+  ai_vox_engine.Start(audio_input_device, g_audio_output_device);
+  
+  printf("AI engine started (checking status)...\n");
+  delay(1000);
+  
+  printf("AI engine start attempt completed\n");
+  g_display->ShowStatus("AI引擎启动完成");
+  
+  return true;
+}
+
+// 非阻塞配网处理
+void ProcessWiFiConfig() {
+  switch (g_wifi_config_state) {
+    case WiFiConfigState::IDLE:
+      if (digitalRead(kTriggerPin) == LOW) {
+        g_config_start_time = millis();
+        g_wifi_config_state = WiFiConfigState::CHECKING_BUTTON;
+        g_display->ShowStatus("请保持按下5秒");
+        printf("Button pressed, starting config check\n");
+      }
+      break;
+      
+    case WiFiConfigState::CHECKING_BUTTON:
+      if (digitalRead(kTriggerPin) == HIGH) {
+        g_wifi_config_state = WiFiConfigState::IDLE;
+        g_display->ShowStatus("配网取消");
+        printf("Button released, config cancelled\n");
+        return;
+      }
+      
+      if (millis() - g_config_start_time > kConfigButtonPressTime) {
+        g_wifi_config_state = WiFiConfigState::CONFIG_PORTAL;
+        g_display->ShowStatus("进入配网模式");
+        printf("Entering config portal mode\n");
+        
+        if (g_wifiManager) {
+          delete g_wifiManager;
+          g_wifiManager = nullptr;
+        }
+        g_wifiManager = new WiFiManager();
+        
+        g_wifiManager->setAPCallback([](WiFiManager *wm) {
+          Serial.println("进入配网模式");
+        });
+        
+        g_wifiManager->setConnectTimeout(0);
+        g_wifiManager->setConfigPortalTimeout(300);
+        g_wifiManager->setConfigPortalBlocking(false);
+        
+        if (!g_wifiManager->startConfigPortal("AI_燕归乐")) {
+          Serial.println("启动配网门户失败");
+        } else {
+          Serial.println("配网门户已启动");
+        }
+        g_config_start_time = millis();
+      }
+      break;
+      
+    case WiFiConfigState::CONFIG_PORTAL:
+      if (g_wifiManager) {
+        g_wifiManager->process();
+        
+        if (WiFi.status() == WL_CONNECTED) {
+          g_wifi_config_state = WiFiConfigState::CONNECTED;
+          g_display->ShowStatus("WiFi已连接");
+          printf("WiFi connected successfully\n");
+          
+          delete g_wifiManager;
+          g_wifiManager = nullptr;
+          
+          g_ai_engine_started = false;
+          g_engine_retry_count = 0;
+          return;
+        }
+        
+        if (millis() - g_config_start_time > kConfigPortalTimeout) {
+          g_display->ShowStatus("配网超时");
+          printf("Config portal timeout\n");
+          delay(2000);
+          
+          delete g_wifiManager;
+          g_wifiManager = nullptr;
+          ESP.restart();
+        }
+      }
+      break;
+      
+    default:
+      break;
+  }
+}
+
+void StartWiFiConfig() {
+  pinMode(kTriggerPin, INPUT_PULLUP);
+  
+  printf("尝试自动连接已保存的WiFi\n");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin();
+  
+  unsigned long start = millis();
+  bool connected = false;
+  
+  while (millis() - start < 10000) {
+    if (WiFi.status() == WL_CONNECTED) {
+      connected = true;
+      break;
+    }
+    delay(500);
+    Serial.print(".");
+  }
+  
+  if (connected) {
+    g_wifi_config_state = WiFiConfigState::CONNECTED;
+    g_display->ShowStatus("WiFi已连接");
+    printf("自动连接WiFi成功\n");
+    return;
+  }
+  
+  g_wifi_config_state = WiFiConfigState::IDLE;
+  printf("自动连接失败，等待按键配网\n");
+  g_display->ShowStatus("请长按按键5秒配网");
+}
+
+// 处理按钮逻辑
+void HandleButtonLogic() {
+  static unsigned long last_button_check = 0;
+  static bool button_pressed = false;
+  static unsigned long button_press_start = 0;
+  
+  if (millis() - last_button_check > 50) {
+    last_button_check = millis();
+    
+    if (digitalRead(kTriggerPin) == LOW) {
+      if (!button_pressed) {
+        button_pressed = true;
+        button_press_start = millis();
+        printf("Button pressed\n");
+      } else {
+        if (millis() - button_press_start > 5000) {
+          printf("Long press detected, resetting WiFi...\n");
+          g_display->ShowStatus("重置WiFi...");
+          
+          WiFiManager wifiManager;
+          wifiManager.resetSettings();
+          WiFi.disconnect(true);
+          
+          delay(1000);
+          ESP.restart();
+        }
+      }
+    } else {
+      if (button_pressed) {
+        unsigned long press_duration = millis() - button_press_start;
+        button_pressed = false;
+        
+        if (press_duration > 50 && press_duration < 500) {
+          printf("Short press detected, triggering AI engine\n");
+          
+          if (g_ai_engine_started) {
+            auto& engine = ai_vox::Engine::GetInstance();
+            engine.Advance();
+            printf("AI engine triggered to start listening\n");
+            g_display->ShowStatus("触发聆听");
+          } else {
+            printf("AI engine not started, cannot trigger\n");
+          }
+        }
+      }
+    }
+  }
+}
+
+void InitMcpTools() {
+  auto& engine = ai_vox::Engine::GetInstance();
+  engine.AddMcpTool("self.audio_speaker.set_volume",
+                    "Set the volume of the audio speaker.",
+                    {
+                        {
+                            "volume",
+                            ai_vox::ParamSchema<int64_t>{
+                                .default_value = std::nullopt,
+                                .min = 0,
+                                .max = 100,
+                            },
+                        },
+                    }
+  );
+
+  engine.AddMcpTool("self.audio_speaker.get_volume",
+                    "Get the volume of the audio speaker.",
+                    {}
+  );
+
+  engine.AddMcpTool("self.led.set",
+                    "Set the state of the LED, true for on, false for off.",
+                    {
+                        {
+                            "state",
+                            ai_vox::ParamSchema<bool>{
+                                .default_value = std::nullopt,
+                            },
+                        },
+                    }
+  );
+
+  engine.AddMcpTool("self.led.get",
+                    "Get the state of the LED, true for on, false for off.",
+                    {}
+  );
+}
+}  // namespace
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  printf("\n\n===== AI VOX Setup Start =====\n");
+  
+  pinMode(kLedPin, OUTPUT);
+  digitalWrite(kLedPin, LOW);
+  
+  InitDisplay();
+  g_display->ShowStatus("初始化中...");
+  
+  StartWiFiConfig();
+  
+  InitUnoCommunication();
+  
+  InitMcpTools();
+
+  // 初始化顺序任务结构
+  g_sequential_task.active = false;
+  g_sequential_task.current_index = 0;
+  
+  printf("===== AI VOX Setup Complete =====\n");
+}
+
+void loop() {
+  // 处理配网状态机
+  if (g_wifi_config_state != WiFiConfigState::CONNECTED) {
+    ProcessWiFiConfig();
+    delay(kConfigCheckInterval);
+    return;
+  }
+  
+  // 处理按钮逻辑
+  HandleButtonLogic();
+  
+  // 处理来自UNO的消息
+  ProcessUnoMessages();
+
+  // ============================================================
+  // 任务管理调度（在AI引擎循环之前检查，确保非阻塞）
+  // ============================================================
+  ProcessTimedReminders();
+  ProcessSequentialTask();
+
+  // 【新增：集中处理队列中积压的消息，避免局部发送失败后丢弃】
+  if (!g_text_queue.empty()) {
+    ProcessTextQueue();
+  }
+  
+  // WiFi已连接，启动AI引擎（如果尚未启动）
+  if (!g_ai_engine_started) {
+    #if AUDIO_INPUT_DEVICE_TYPE == AUDIO_INPUT_DEVICE_TYPE_I2S_STD
+    auto audio_input_device = std::make_shared<ai_vox::AudioInputDeviceI2sStd>(kMicPinSck, kMicPinWs, kMicPinSd);
+    #elif AUDIO_INPUT_DEVICE_TYPE == AUDIO_INPUT_DEVICE_TYPE_PDM
+    auto audio_input_device = std::make_shared<ai_vox::PdmAudioInputDevice>(kMicPinSck, kMicPinSd);
+    #endif
+    
+    printf("尝试启动AI引擎 (尝试 %d/%d)...\n", g_engine_retry_count + 1, kMaxEngineRetries);
+    
+    if (StartAIEngine(audio_input_device)) {
+      g_ai_engine_started = true;
+      g_engine_retry_count = 0;
+      g_engine_needs_restart = false;
+      printf("AI引擎启动尝试完成\n");
+      g_display->ShowStatus("系统准备就绪");
+      Serial.println("系统就绪，等待语音命令或UNO消息...");
+    } else {
+      g_engine_retry_count++;
+      g_engine_start_time = millis();
+      
+      if (g_engine_retry_count >= kMaxEngineRetries) {
+        printf("AI引擎启动失败，已达到最大重试次数\n");
+        g_display->ShowStatus("启动失败，请重启");
+        delay(5000);
+        ESP.restart();
+      } else {
+        printf("AI引擎启动失败，%d秒后重试...\n", kEngineRetryDelay / 1000);
+        char retry_msg[32];
+        snprintf(retry_msg, sizeof(retry_msg), "启动失败 %d/%d", g_engine_retry_count, kMaxEngineRetries);
+        g_display->ShowStatus(retry_msg);
+      }
+    }
+  }
+  
+  if (!g_ai_engine_started && g_engine_start_time > 0) {
+    if (millis() - g_engine_start_time > kEngineRetryDelay) {
+      g_ai_engine_started = false;
+    }
+  }
+  
+  // 如果AI引擎已启动，处理事件
+  if (g_ai_engine_started) {
+    auto& engine = ai_vox::Engine::GetInstance();
+    const auto events = g_observer->PopEvents();
+
+    for (auto& event : events) {
+      if (auto text_received_event = std::get_if<ai_vox::TextReceivedEvent>(&event)) {
+        printf("on text received: %s\n", text_received_event->content.c_str());
+        
+        if (IsHelloMessage(text_received_event->content)) {
+          printf("检测到hello消息，尝试提取session_id\n");
+          ExtractSessionId(text_received_event->content);
+        }
+      } else if (auto activation_event = std::get_if<ai_vox::ActivationEvent>(&event)) {
+        printf("activation code: %s, message: %s\n", activation_event->code.c_str(), activation_event->message.c_str());
+        g_display->ShowStatus("激活设备");
+        g_display->SetChatMessage(activation_event->message);
+      } else if (auto state_changed_event = std::get_if<ai_vox::StateChangedEvent>(&event)) {
+        g_current_chat_state = state_changed_event->new_state;
+        
+        printf("状态变化 -> 新状态: %d\n", static_cast<int>(state_changed_event->new_state));
+        
+        switch (state_changed_event->new_state) {
+          case ai_vox::ChatState::kIdle: {
+            printf("状态: Idle (空闲)\n");
+            g_display->ShowStatus("空闲");
+            break;
+          }
+          case ai_vox::ChatState::kInitted: {
+            printf("Initted\n");
+            g_display->ShowStatus("初始化完成");
+            break;
+          }
+          case ai_vox::ChatState::kLoading: {
+            printf("Loading...\n");
+            g_display->ShowStatus("加载协议中");
+            break;
+          }
+          case ai_vox::ChatState::kLoadingFailed: {
+            printf("Loading failed, please retry\n");
+            g_display->ShowStatus("加载协议失败，请重试");
+            g_engine_needs_restart = true;
+            g_ai_engine_started = false;
+            printf("标记引擎需要重启，将在下次循环中重试\n");
+            break;
+          }
+          case ai_vox::ChatState::kStandby: {
+            // 待命状态对用户不可见，立即自动推进到聆听状态
+            printf("状态: Standby -> 自动推进至聆听\n");
+            engine.Advance();
+            break;
+          }
+          case ai_vox::ChatState::kConnecting: {
+            printf("Connecting...\n");
+            g_display->ShowStatus("连接中...");
+            break;
+          }
+          case ai_vox::ChatState::kListening: {
+            printf("状态: Listening (聆听中)\n");
+            g_display->ShowStatus("聆听中");
+            // 移除了这里的 ProcessTextQueue(); 因为在外部的主循环中已经集中调度了
+            break;
+          }
+          case ai_vox::ChatState::kSpeaking: {
+            printf("Speaking...\n");
+            g_display->ShowStatus("说话中");
+            break;
+          }
+          default: {
+            break;
+          }
+        }
+      } else if (auto emotion_event = std::get_if<ai_vox::EmotionEvent>(&event)) {
+        printf("emotion: %s\n", emotion_event->emotion.c_str());
+        g_display->SetEmotion(emotion_event->emotion);
+      } else if (auto chat_message_event = std::get_if<ai_vox::ChatMessageEvent>(&event)) {
+        switch (chat_message_event->role) {
+          case ai_vox::ChatRole::kAssistant: {
+            printf("role: assistant, content: %s\n", chat_message_event->content.c_str());
+            g_display->SetChatMessage(chat_message_event->content);
+            processMashangCommand(chat_message_event->content);
+            break;
+          }
+          case ai_vox::ChatRole::kUser: {
+            printf("role: user, content: %s\n", chat_message_event->content.c_str());
+            // ============================================================
+            // 任务管理：在用户语音识别结果到达时，
+            // 尝试在本地解析任务指令，若成功则不再转发给AI
+            // ============================================================
+            {
+              const std::string& user_text = chat_message_event->content;
+              if (TryParseAndCreateTask(user_text)) {
+                // 任务已在本地创建，无需AI处理
+                // 仅更新显示，不发送给AI
+                g_display->SetChatMessage("用户: " + user_text);
+                printf("任务已在本地处理，跳过AI\n");
+              } else {
+                // 普通对话，交给AI
+                g_display->SetChatMessage(chat_message_event->content);
+              }
+            }
+            break;
+          }
+        }
+      } else if (auto mcp_tool_call_event = std::get_if<ai_vox::McpToolCallEvent>(&event)) {
+        printf("on mcp tool call: %s\n", mcp_tool_call_event->ToString().c_str());
+
+        if ("self.audio_speaker.set_volume" == mcp_tool_call_event->name) {
+          const auto volume_ptr = mcp_tool_call_event->param<int64_t>("volume");
+          if (volume_ptr != nullptr) {
+            printf("on mcp tool call: self.audio_speaker.set_volume, volume: %" PRId64 "\n", *volume_ptr);
+            g_audio_output_device->set_volume(*volume_ptr);
+            engine.SendMcpCallResponse(mcp_tool_call_event->id, true);
+          } else {
+            engine.SendMcpCallError(mcp_tool_call_event->id, "Missing valid argument: volume");
+          }
+        } else if ("self.audio_speaker.get_volume" == mcp_tool_call_event->name) {
+          const auto volume = g_audio_output_device->volume();
+          printf("on mcp tool call: self.audio_speaker.get_volume, volume: %" PRIu16 "\n", volume);
+          engine.SendMcpCallResponse(mcp_tool_call_event->id, volume);
+        } else if ("self.led.set" == mcp_tool_call_event->name) {
+          const auto state_ptr = mcp_tool_call_event->param<bool>("state");
+          if (state_ptr != nullptr) {
+            printf("on mcp tool call: self.led.set, state: %d\n", *state_ptr);
+            digitalWrite(kLedPin, *state_ptr);
+            engine.SendMcpCallResponse(mcp_tool_call_event->id, true);
+          } else {
+            engine.SendMcpCallError(mcp_tool_call_event->id, "Missing valid argument: state");
+          }
+        } else if ("self.led.get" == mcp_tool_call_event->name) {
+          const auto state = digitalRead(kLedPin) == HIGH;
+          printf("on mcp tool call: self.led.get, state: %d\n", state);
+          engine.SendMcpCallResponse(mcp_tool_call_event->id, state);
+        }
+      }
+    }
+  }
+  
+  delay(10);
+}

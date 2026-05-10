@@ -1,0 +1,297 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <driver/i2c_master.h>
+#include <esp_lcd_io_i2c.h>
+#include <esp_lcd_panel_ops.h>
+#include <esp_lcd_panel_ssd1306.h>
+#include <WiFiManager.h>
+#include <SPI.h>
+#include <MFRC522.h>
+
+#include "ai_vox_engine.h"
+#include "audio_device/audio_input_device_i2s_std.h"
+#include "audio_device/audio_input_device_pdm.h"
+#include "audio_device/audio_output_device_i2s_std.h"
+#include "components/espressif/button/button_gpio.h"
+#include "components/espressif/button/iot_button.h"
+#include "display.h"
+
+#ifndef ARDUINO_ESP32S3_DEV
+#error "This example only supports ESP32S3-Dev board."
+#endif
+
+#define AUDIO_INPUT_DEVICE_TYPE_I2S_STD (1)
+#define AUDIO_INPUT_DEVICE_TYPE AUDIO_INPUT_DEVICE_TYPE_I2S_STD
+
+// --- 引脚定义 ---
+constexpr gpio_num_t kMicPinSck = GPIO_NUM_5;
+constexpr gpio_num_t kMicPinWs = GPIO_NUM_4;
+constexpr gpio_num_t kMicPinSd = GPIO_NUM_6;
+
+constexpr gpio_num_t kSpeakerPinSck = GPIO_NUM_15;
+constexpr gpio_num_t kSpeakerPinWs = GPIO_NUM_16;
+constexpr gpio_num_t kSpeakerPinSd = GPIO_NUM_7;
+
+constexpr gpio_num_t kI2cPinSda = GPIO_NUM_41;
+constexpr gpio_num_t kI2cPinScl = GPIO_NUM_42;
+
+constexpr gpio_num_t kButtonBoot = GPIO_NUM_0;
+constexpr gpio_num_t kLedPin = GPIO_NUM_2;
+
+// RC522 引脚 (保持你原有的定义)
+constexpr int kRc522PinSda  = 10;   // SS/CS (片选)
+constexpr int kRc522PinSck  = 12;   // SCK   (时钟)
+constexpr int kRc522PinMosi = 11;   // MOSI  (主出从入)
+constexpr int kRc522PinMiso = 13;   // MISO  (主入从出) - 解决了与 LED 的冲突
+constexpr int kRc522PinRst  = 14;   // RST   (复位) - 原来的 21 也可以用，但 14 离上面的一组更近
+
+// --- 全局对象 ---
+std::unique_ptr<Display> g_display;
+auto g_observer = std::make_shared<ai_vox::Observer>();
+auto g_audio_output_device = std::make_shared<ai_vox::AudioOutputDeviceI2sStd>(kSpeakerPinSck, kSpeakerPinWs, kSpeakerPinSd);
+button_handle_t g_button_boot_handle = nullptr;
+MFRC522 mfrc522(kRc522PinSda, kRc522PinRst); 
+
+// --- 状态变量 ---
+enum class WiFiConfigState { IDLE, CHECKING_BUTTON, CONFIG_PORTAL, CONNECTED };
+WiFiConfigState g_wifi_config_state = WiFiConfigState::IDLE;
+unsigned long g_config_start_time = 0;
+WiFiManager *g_wifiManager = nullptr;
+
+String g_last_card_id = "";
+unsigned long g_last_card_time = 0;
+bool g_rc522_initialized = false;
+
+// --- 函数声明 ---
+void InitDisplay();
+void ProcessWiFiConfig();
+void StartWiFiConfig();
+void InitMcpTools();
+
+// --- RC522 逻辑修正 ---
+bool InitRC522() {
+    printf("Initializing RC522...\n");
+    // 显式初始化 SPI
+    SPI.begin(kRc522PinSck, kRc522PinMiso, kRc522PinMosi, kRc522PinSda);
+    
+    mfrc522.PCD_Init();
+    delay(10);
+    
+    byte v = mfrc522.PCD_ReadRegister(mfrc522.VersionReg);
+    printf("RC522 Version: 0x%02X\n", v);
+    
+    if (v == 0x00 || v == 0xFF) {
+        printf("RC522 self-test failed! Check wiring.\n");
+        return false;
+    }
+    
+    mfrc522.PCD_SetAntennaGain(mfrc522.RxGain_max);
+    g_rc522_initialized = true;
+    return true;
+}
+
+String ReadCardNumber() {
+    if (!g_rc522_initialized) return "";
+
+    // 检查是否有新卡
+    if (!mfrc522.PICC_IsNewCardPresent()) return "";
+    if (!mfrc522.PICC_ReadCardSerial()) return "";
+
+    String cardId = "";
+    for (byte i = 0; i < mfrc522.uid.size; i++) {
+        cardId += (mfrc522.uid.uidByte[i] < 0x10 ? "0" : "");
+        cardId += String(mfrc522.uid.uidByte[i], HEX);
+        if (i < mfrc522.uid.size - 1) cardId += ":";
+    }
+    cardId.toUpperCase();
+
+    // 停止读卡，释放总线
+    mfrc522.PICC_HaltA();
+    mfrc522.PCD_StopCrypto1();
+    
+    return cardId;
+}
+
+// --- 核心初始化 ---
+void setup() {
+    Serial.begin(115200);
+    pinMode(kLedPin, OUTPUT);
+    digitalWrite(kLedPin, LOW);
+    pinMode(kButtonBoot, INPUT_PULLUP);
+
+    InitDisplay();
+    g_display->ShowStatus("系统启动中");
+
+    // 初始化 RC522
+    if (InitRC522()) {
+        g_display->ShowStatus("RC522 已就绪");
+    } else {
+        g_display->ShowStatus("RC522 异常");
+    }
+
+    StartWiFiConfig();
+}
+
+void loop() {
+    // 1. WiFi 配网处理
+    if (g_wifi_config_state != WiFiConfigState::CONNECTED) {
+        ProcessWiFiConfig();
+        delay(50);
+        return;
+    }
+
+    // 2. AI 引擎初始化 (仅一次)
+    static bool engine_started = false;
+    if (!engine_started) {
+        engine_started = true;
+        InitMcpTools();
+
+        auto audio_input_device = std::make_shared<ai_vox::AudioInputDeviceI2sStd>(kMicPinSck, kMicPinWs, kMicPinSd);
+        auto& engine = ai_vox::Engine::GetInstance();
+        engine.SetObserver(g_observer);
+        engine.SetOtaUrl("https://api.tenclass.net/xiaozhi/ota/");
+        engine.ConfigWebsocket("wss://api.tenclass.net/xiaozhi/v1/", {{"Authorization", "Bearer test-token"}});
+        
+        engine.Start(audio_input_device, g_audio_output_device);
+        g_display->ShowStatus("AI 已就绪");
+
+        // 注册按钮回调
+        const button_config_t btn_cfg = { .long_press_time = 1000, .short_press_time = 50 };
+        const button_gpio_config_t gpio_cfg = { .gpio_num = kButtonBoot, .active_level = 0 };
+        iot_button_new_gpio_device(&btn_cfg, &gpio_cfg, &g_button_boot_handle);
+        iot_button_register_cb(g_button_boot_handle, BUTTON_PRESS_DOWN, nullptr, [](void* b, void* u){
+            ai_vox::Engine::GetInstance().Advance();
+        }, nullptr);
+    }
+
+    // 3. 周期性读卡检测 (每 500ms 检查一次，避免占用过多 CPU)
+    static unsigned long last_rfid_check = 0;
+    if (millis() - last_rfid_check > 500) {
+        last_rfid_check = millis();
+        String cid = ReadCardNumber();
+        if (cid != "") {
+            g_last_card_id = cid;
+            g_last_card_time = millis();
+            printf("Detected Card: %s\n", cid.c_str());
+            g_display->ShowStatus(("卡号: " + cid).c_str());
+        }
+    }
+
+    // 4. 处理 AI 事件
+    auto& engine = ai_vox::Engine::GetInstance();
+    const auto events = g_observer->PopEvents();
+    for (auto& event : events) {
+        if (auto state_event = std::get_if<ai_vox::StateChangedEvent>(&event)) {
+            // 根据状态更新显示 (省略部分重复代码，参考 main1.txt)
+            if(state_event->new_state == ai_vox::ChatState::kSpeaking) g_display->ShowStatus("说话中");
+            if(state_event->new_state == ai_vox::ChatState::kListening) g_display->ShowStatus("聆听中");
+        } 
+        else if (auto msg_event = std::get_if<ai_vox::ChatMessageEvent>(&event)) {
+            g_display->SetChatMessage(msg_event->content);
+        }
+        else if (auto mcp_event = std::get_if<ai_vox::McpToolCallEvent>(&event)) {
+            // --- MCP 工具处理 ---
+            if (mcp_event->name == "self.rfid.get_last_card") {
+                engine.SendMcpCallResponse(mcp_event->id, g_last_card_id.length() > 0 ? g_last_card_id.c_str() : "No card detected");
+            } 
+            else if (mcp_event->name == "self.rfid.read_now") {
+                String cid = ReadCardNumber();
+                engine.SendMcpCallResponse(mcp_event->id, cid != "" ? cid.c_str() : "No card near reader");
+            }
+            else if (mcp_event->name == "self.led.set") {
+                auto state = mcp_event->param<bool>("state");
+                if (state) digitalWrite(kLedPin, *state ? HIGH : LOW);
+                engine.SendMcpCallResponse(mcp_event->id, true);
+            }
+            // ... 其他工具 (音量等)
+        }
+    }
+
+    // 5. 强制配网长按检测
+    if (digitalRead(kButtonBoot) == LOW) {
+        static unsigned long press_start = 0;
+        if (press_start == 0) press_start = millis();
+        if (millis() - press_start > 5000) {
+            WiFiManager wm;
+            wm.resetSettings();
+            ESP.restart();
+        }
+    } else {
+        static unsigned long press_start = 0;
+        press_start = 0;
+    }
+
+    delay(10);
+}
+
+// --- 辅助函数实现 ---
+
+void InitDisplay() {
+    i2c_master_bus_handle_t bus;
+    i2c_master_bus_config_t bus_cfg = {
+        .i2c_port = I2C_NUM_0, .sda_io_num = kI2cPinSda, .scl_io_num = kI2cPinScl,
+        .clk_source = I2C_CLK_SRC_DEFAULT, .glitch_ignore_cnt = 7,
+    };
+    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_cfg, &bus));
+
+    esp_lcd_panel_io_handle_t io;
+    esp_lcd_panel_io_i2c_config_t io_cfg = { .dev_addr = 0x3C, .control_phase_bytes = 1, .dc_bit_offset = 6, .lcd_cmd_bits = 8, .lcd_param_bits = 8, .scl_speed_hz = 400000 };
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c_v2(bus, &io_cfg, &io));
+
+    esp_lcd_panel_handle_t panel;
+    esp_lcd_panel_dev_config_t p_cfg = { .reset_gpio_num = -1, .bits_per_pixel = 1 };
+    esp_lcd_panel_ssd1306_config_t s_cfg = { .height = 64 };
+    p_cfg.vendor_config = &s_cfg;
+
+    ESP_ERROR_CHECK(esp_lcd_new_panel_ssd1306(io, &p_cfg, &panel));
+    esp_lcd_panel_reset(panel);
+    esp_lcd_panel_init(panel);
+    esp_lcd_panel_disp_on_off(panel, true);
+    g_display = std::make_unique<Display>(io, panel, 128, 64, true, true);
+    g_display->Start();
+}
+
+void StartWiFiConfig() {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin();
+    unsigned long start = millis();
+    while (millis() - start < 5000) {
+        if (WiFi.status() == WL_CONNECTED) {
+            g_wifi_config_state = WiFiConfigState::CONNECTED;
+            return;
+        }
+        delay(100);
+    }
+    g_display->ShowStatus("长按5秒进入配网");
+}
+
+void ProcessWiFiConfig() {
+    if (g_wifi_config_state == WiFiConfigState::IDLE && digitalRead(kButtonBoot) == LOW) {
+        g_config_start_time = millis();
+        g_wifi_config_state = WiFiConfigState::CHECKING_BUTTON;
+    } else if (g_wifi_config_state == WiFiConfigState::CHECKING_BUTTON) {
+        if (digitalRead(kButtonBoot) == HIGH) g_wifi_config_state = WiFiConfigState::IDLE;
+        else if (millis() - g_config_start_time > 5000) {
+            g_wifi_config_state = WiFiConfigState::CONFIG_PORTAL;
+            g_wifiManager = new WiFiManager();
+            g_wifiManager->setConfigPortalBlocking(false);
+            g_wifiManager->startConfigPortal("AI_VOX_SETTING");
+        }
+    } else if (g_wifi_config_state == WiFiConfigState::CONFIG_PORTAL) {
+        g_wifiManager->process();
+        if (WiFi.status() == WL_CONNECTED) {
+            g_wifi_config_state = WiFiConfigState::CONNECTED;
+            delete g_wifiManager;
+            g_wifiManager = nullptr;
+        }
+    }
+}
+
+void InitMcpTools() {
+    auto& engine = ai_vox::Engine::GetInstance();
+    // 基础工具
+    engine.AddMcpTool("self.led.set", "Control LED", {{"state", ai_vox::ParamSchema<bool>{}}});
+    // RFID 工具
+    engine.AddMcpTool("self.rfid.get_last_card", "Get the last scanned RFID card ID", {});
+    engine.AddMcpTool("self.rfid.read_now", "Try to read a card right now", {});
+}

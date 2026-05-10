@@ -1,0 +1,1070 @@
+#include <Arduino.h>
+#include <driver/i2c_master.h>
+#include <esp_lcd_io_i2c.h>
+#include <esp_lcd_panel_ops.h>
+#include <esp_lcd_panel_ssd1306.h>
+#include <WiFiManager.h>
+#include <time.h>         // NTP绝对时间（不依赖NVS）
+#include <algorithm>
+#include <memory>
+#include <cstdio>
+#include <vector>
+#include <string>
+#include <sstream>
+
+#include "ai_vox_engine.h"
+#include "audio_device/audio_input_device_i2s_std.h"
+#include "audio_device/audio_input_device_pdm.h"
+#include "audio_device/audio_output_device_i2s_std.h"
+#include "components/espressif/esp_audio_codec/esp_audio_simple_dec.h"
+#include "components/espressif/esp_audio_codec/esp_mp3_dec.h"
+#include "display.h"
+
+#ifndef ARDUINO_ESP32_DEV
+#error "This example only supports ESP32-Dev board."
+#endif
+
+#define AUDIO_INPUT_DEVICE_TYPE_PDM     (0)
+#define AUDIO_INPUT_DEVICE_TYPE_I2S_STD (1)
+#define AUDIO_INPUT_DEVICE_TYPE AUDIO_INPUT_DEVICE_TYPE_I2S_STD
+
+// 配网状态机
+enum class WiFiConfigState {
+  IDLE,
+  CHECKING_BUTTON,
+  CONFIG_PORTAL,
+  CONNECTED
+};
+
+// ============================================================
+// 数据结构
+// ============================================================
+
+// 定时提醒：同时保留 millis 和 epoch 两种计时，运行时按实际情况选用
+struct TimedReminder {
+  unsigned long trigger_ms;    // millis()触发时刻（相对时间）
+  time_t        trigger_epoch; // Unix时间戳触发时刻（绝对时间，需NTP）
+  bool          use_epoch;     // true=用epoch，false=用millis
+  std::string   reminder_text;
+  bool          fired;
+};
+
+// 顺序播报任务
+struct SequentialTask {
+  std::vector<std::string> messages;
+  size_t        current_index;
+  unsigned long next_send_time_ms;
+  bool          active;
+};
+
+namespace {
+
+// ----------------------------------------------------------------
+// 硬件引脚
+// ----------------------------------------------------------------
+#if AUDIO_INPUT_DEVICE_TYPE == AUDIO_INPUT_DEVICE_TYPE_I2S_STD
+constexpr gpio_num_t kMicPinSck = GPIO_NUM_26;
+constexpr gpio_num_t kMicPinWs  = GPIO_NUM_25;
+constexpr gpio_num_t kMicPinSd  = GPIO_NUM_27;
+#elif AUDIO_INPUT_DEVICE_TYPE == AUDIO_INPUT_DEVICE_TYPE_PDM
+constexpr gpio_num_t kMicPinSck = GPIO_NUM_12;
+constexpr gpio_num_t kMicPinSd  = GPIO_NUM_13;
+#endif
+
+constexpr gpio_num_t kSpeakerPinSck = GPIO_NUM_16;
+constexpr gpio_num_t kSpeakerPinWs  = GPIO_NUM_15;
+constexpr gpio_num_t kSpeakerPinSd  = GPIO_NUM_17;
+constexpr gpio_num_t kI2cPinSda     = GPIO_NUM_21;
+constexpr gpio_num_t kI2cPinScl     = GPIO_NUM_22;
+constexpr gpio_num_t kTriggerPin    = GPIO_NUM_35;
+constexpr gpio_num_t kLedPin        = GPIO_NUM_2;
+constexpr gpio_num_t kUnoTxPin      = GPIO_NUM_13;
+constexpr gpio_num_t kUnoRxPin      = GPIO_NUM_14;
+
+constexpr uint32_t kDisplayWidth   = 128;
+constexpr uint32_t kDisplayHeight  = 64;
+constexpr bool     kDisplayMirrorX = true;
+constexpr bool     kDisplayMirrorY = true;
+
+// ----------------------------------------------------------------
+// 全局对象
+// ----------------------------------------------------------------
+std::unique_ptr<Display> g_display;
+auto g_observer = std::make_shared<ai_vox::Observer>();
+auto g_audio_output_device = std::make_shared<ai_vox::AudioOutputDeviceI2sStd>(
+    kSpeakerPinSck, kSpeakerPinWs, kSpeakerPinSd);
+
+// 配网
+WiFiConfigState g_wifi_config_state = WiFiConfigState::IDLE;
+unsigned long   g_config_start_time = 0;
+constexpr unsigned long kConfigCheckInterval   = 50;
+constexpr unsigned long kConfigButtonPressTime = 5000;
+constexpr unsigned long kConfigPortalTimeout   = 180000;
+WiFiManager *g_wifiManager = nullptr;
+
+// AI引擎
+bool          g_ai_engine_started  = false;
+unsigned long g_engine_start_time  = 0;
+constexpr unsigned long kEngineRetryDelay = 10000;
+constexpr int           kMaxEngineRetries = 3;
+int  g_engine_retry_count = 0;
+
+// 当前引擎状态
+ai_vox::ChatState g_current_chat_state = ai_vox::ChatState::kIdle;
+
+// 文本队列 / 会话ID
+std::vector<std::string> g_text_queue;
+std::string g_session_id;
+
+// UNO通信
+HardwareSerial unoSerial(2);
+bool unoConnected = false;
+
+// NTP（仅用于绝对时间提醒）
+bool g_ntp_synced    = false;
+bool g_ntp_init_done = false;
+
+// 任务管理
+std::vector<TimedReminder> g_timed_reminders;
+SequentialTask             g_sequential_task;
+constexpr unsigned long    kSequentialIntervalMs = 1000;
+
+// ================================================================
+// UTF-8 工具函数
+// ================================================================
+int getUtf8CharLength(unsigned char b) {
+  if ((b & 0x80) == 0x00) return 1;
+  if ((b & 0xE0) == 0xC0) return 2;
+  if ((b & 0xF0) == 0xE0) return 3;
+  if ((b & 0xF8) == 0xF0) return 4;
+  return 1;
+}
+
+size_t getChineseCharLength(const std::string& str, size_t pos) {
+  if (pos >= str.length()) return 0;
+  unsigned char b = (unsigned char)str[pos];
+  if ((b & 0xE0) == 0xE0 && pos + 2 < str.length()) {
+    if (((unsigned char)str[pos+1] & 0xC0) == 0x80 &&
+        ((unsigned char)str[pos+2] & 0xC0) == 0x80) return 3;
+  }
+  return 1;
+}
+
+std::vector<std::string> SplitUtf8Chars(const std::string& s) {
+  std::vector<std::string> out;
+  size_t i = 0;
+  while (i < s.length()) {
+    int len = getUtf8CharLength((unsigned char)s[i]);
+    if (i + len <= s.length()) out.push_back(s.substr(i, len));
+    i += len;
+  }
+  return out;
+}
+
+bool ContainsCN(const std::string& s, const std::string& kw) {
+  return s.find(kw) != std::string::npos;
+}
+
+std::string TrimPunctuation(const std::string& s) {
+  std::string r = s;
+  while (!r.empty()) {
+    char c = r.back();
+    if (c=='.'||c==','||c=='!'||c=='?'||c==';'||
+        c==' '||c=='\t'||c=='\r'||c=='\n') { r.pop_back(); continue; }
+    if (r.length() >= 3) {
+      std::string t3 = r.substr(r.length()-3);
+      if (t3=="。"||t3=="，"||t3=="！"||t3=="？"||t3=="、") {
+        r = r.substr(0, r.length()-3); continue;
+      }
+    }
+    break;
+  }
+  size_t st = 0;
+  while (st < r.length() && (r[st]==' '||r[st]=='\t')) st++;
+  return r.substr(st);
+}
+
+// ================================================================
+// 中文数字解析（支持一/两/三...十/百/千，及阿拉伯数字）
+// ================================================================
+int ParseChineseInt(const std::string& s) {
+  if (s.empty()) return -1;
+  // 纯ASCII数字快速路径
+  bool all_ascii = true;
+  for (char c : s) if ((unsigned char)c > 127) { all_ascii = false; break; }
+  if (all_ascii) {
+    for (char c : s) if (c < '0' || c > '9') return -1;
+    return atoi(s.c_str());
+  }
+  static const struct { const char* ch; int val; } MAP[] = {
+    {"零",0},{"〇",0},{"一",1},{"壹",1},{"二",2},{"贰",2},{"两",2},
+    {"三",3},{"叁",3},{"四",4},{"肆",4},{"五",5},{"伍",5},
+    {"六",6},{"陆",6},{"七",7},{"柒",7},{"八",8},{"捌",8},
+    {"九",9},{"玖",9},{nullptr,0}
+  };
+  auto digitVal = [&](const std::string& ch, int& out) -> bool {
+    if (ch.size()==1&&ch[0]>='0'&&ch[0]<='9'){out=ch[0]-'0';return true;}
+    for (int i=0;MAP[i].ch;i++) if(ch==MAP[i].ch){out=MAP[i].val;return true;}
+    return false;
+  };
+  auto chars = SplitUtf8Chars(s);
+  if (chars.empty()) return -1;
+  int result=0, section=0; bool has_section=false;
+  for (const auto& ch : chars) {
+    int d;
+    if (digitVal(ch,d))   { section=d; has_section=true; }
+    else if (ch=="十")    { if(!has_section)section=1; result+=section*10;   section=0;has_section=false; }
+    else if (ch=="百")    { if(!has_section)section=1; result+=section*100;  section=0;has_section=false; }
+    else if (ch=="千")    { if(!has_section)section=1; result+=section*1000; section=0;has_section=false; }
+    else return -1;
+  }
+  return result + section;
+}
+
+// 从 end_pos 前扫描出连续数字字符串（阿拉伯+中文）
+std::string ScanBackNumberStr(const std::string& s, size_t end_pos) {
+  static const char* CN_NUM[] = {
+    "零","〇","一","壹","二","贰","两","三","叁","四","肆",
+    "五","伍","六","陆","七","柒","八","捌","九","玖","十","百","千",nullptr
+  };
+  auto isCnNum = [](const std::string& ch) {
+    for (int i=0;CN_NUM[i];i++) if(ch==CN_NUM[i]) return true;
+    return false;
+  };
+  std::vector<std::string> chars;
+  size_t p=0;
+  while (p < end_pos) {
+    int cl = getUtf8CharLength((unsigned char)s[p]);
+    if (p+cl > end_pos) break;
+    chars.push_back(s.substr(p,cl));
+    p += cl;
+  }
+  std::string num;
+  for (int i=(int)chars.size()-1; i>=0; i--) {
+    const auto& ch = chars[i];
+    bool ok = (ch.size()==1&&ch[0]>='0'&&ch[0]<='9') || isCnNum(ch);
+    if (ok) num = ch + num; else break;
+  }
+  return num;
+}
+
+// ================================================================
+// 相对时间字符串 → 毫秒（支持阿拉伯+中文数字）
+// 示例：一分钟→60000  两分三十秒→150000  半分钟→30000  一分半→90000
+// ================================================================
+unsigned long ParseTimeToMs(const std::string& ts) {
+  unsigned long minutes=0, seconds=0;
+  bool parsed=false;
+  size_t fen_pos = ts.find("分");
+  if (fen_pos != std::string::npos) {
+    // "半分钟"特殊处理
+    if (fen_pos>=3 && ts.substr(fen_pos-3,3)=="半") {
+      seconds=30; parsed=true;
+    } else {
+      std::string ms = ScanBackNumberStr(ts, fen_pos);
+      if (!ms.empty()) {
+        int v = ParseChineseInt(ms);
+        if (v > 0) { minutes=(unsigned long)v; parsed=true; }
+      }
+    }
+    // 跳过"分"或"分钟"找"秒"
+    size_t miao_start = fen_pos+3;
+    if (fen_pos+6<=ts.length() && ts.substr(fen_pos,6)=="分钟") miao_start=fen_pos+6;
+    size_t miao_pos = ts.find("秒", miao_start);
+    if (miao_pos != std::string::npos) {
+      std::string ss2 = ScanBackNumberStr(ts, miao_pos);
+      if (!ss2.empty()) {
+        int v = ParseChineseInt(ss2);
+        if (v >= 0) { seconds=(unsigned long)v; parsed=true; }
+      }
+    }
+    // "一分半" → 再加30秒
+    size_t ban_pos = ts.find("半");
+    if (parsed && ban_pos!=std::string::npos && ban_pos>fen_pos) seconds=30;
+  } else {
+    size_t miao_pos = ts.find("秒");
+    if (miao_pos != std::string::npos) {
+      std::string ss2 = ScanBackNumberStr(ts, miao_pos);
+      if (!ss2.empty()) {
+        int v = ParseChineseInt(ss2);
+        if (v > 0) { seconds=(unsigned long)v; parsed=true; }
+      }
+    } else {
+      int v = ParseChineseInt(ts);
+      if (v > 0) { seconds=(unsigned long)v; parsed=true; }
+    }
+  }
+  if (!parsed) return 0;
+  return (minutes*60+seconds) * 1000UL;
+}
+
+// ================================================================
+// NTP时间同步（UTC+8，WiFi连接后执行一次）
+// ================================================================
+void SyncNTP() {
+  printf("NTP同步开始...\n");
+  g_display->ShowStatus("时间同步中...");
+  configTime(8*3600, 0, "pool.ntp.org", "cn.pool.ntp.org", "time.nist.gov");
+  struct tm ti;
+  for (int i=0; i<30; i++) {
+    if (getLocalTime(&ti)) {
+      g_ntp_synced = true;
+      char buf[48]; strftime(buf,sizeof(buf),"%Y-%m-%d %H:%M:%S",&ti);
+      printf("NTP同步成功: %s\n", buf);
+      g_display->ShowStatus("时间同步完成");
+      return;
+    }
+    delay(500);
+  }
+  printf("NTP同步失败，绝对时间提醒不可用\n");
+  g_display->ShowStatus("时间同步失败");
+}
+
+// ================================================================
+// JSON / Session 辅助
+// ================================================================
+std::string BuildListenMessage(const std::string& text,
+                               const std::string& state = "detect") {
+  if (g_session_id.empty()) return "";
+  std::stringstream ss;
+  ss << "{\"session_id\":\"" << g_session_id << "\","
+     << "\"type\":\"listen\","
+     << "\"state\":\"" << state << "\","
+     << "\"text\":\"" << text << "\"}";
+  return ss.str();
+}
+
+bool ExtractSessionId(const std::string& json) {
+  size_t pos = json.find("\"session_id\":");
+  if (pos==std::string::npos) return false;
+  pos += 13;
+  while (pos<json.length() && (json[pos]==' '||json[pos]=='\t'||
+         json[pos]=='\n'||json[pos]=='\r')) pos++;
+  if (pos>=json.length()||json[pos]!='"') return false;
+  pos++;
+  size_t end = json.find('"', pos);
+  if (end==std::string::npos) return false;
+  g_session_id = json.substr(pos, end-pos);
+  printf("session_id: %s\n", g_session_id.c_str());
+  return true;
+}
+
+bool IsHelloMessage(const std::string& json) {
+  return json.find("\"type\":\"hello\"")  != std::string::npos ||
+         json.find("\"type\": \"hello\"") != std::string::npos;
+}
+
+// ================================================================
+// 文本发送
+// ================================================================
+bool TrySendText(const std::string& text) {
+  if (!g_ai_engine_started || g_session_id.empty()) return false;
+  auto& engine = ai_vox::Engine::GetInstance();
+  switch (g_current_chat_state) {
+    case ai_vox::ChatState::kListening: {
+      std::string msg = BuildListenMessage(text);
+      if (msg.empty()) return false;
+      engine.SendText(msg);
+      g_display->ShowStatus("发送文本中");
+      g_display->SetChatMessage("用户: " + text);
+      return true;
+    }
+    case ai_vox::ChatState::kStandby:
+      engine.Advance(); return false;
+    case ai_vox::ChatState::kIdle:
+    case ai_vox::ChatState::kConnecting:
+      engine.Advance(); delay(100); return false;
+    case ai_vox::ChatState::kSpeaking:
+    default:
+      return false;
+  }
+}
+
+void ProcessTextQueue() {
+  if (g_text_queue.empty() || !g_ai_engine_started) return;
+  static unsigned long last_try = 0;
+  if (millis()-last_try < 1000) return;
+  std::string text = g_text_queue.front();
+  if (TrySendText(text)) g_text_queue.erase(g_text_queue.begin());
+  last_try = millis();
+}
+
+// ================================================================
+// UNO通信
+// ================================================================
+void InitUnoCommunication() {
+  unoSerial.begin(9600, SERIAL_8N1, kUnoRxPin, kUnoTxPin);
+  unoSerial.setTimeout(100);
+  delay(100);
+  unoSerial.print("TEST:ESP32_CONNECTED\n");
+  unoConnected = true;
+  g_display->ShowStatus("UNO已连接");
+}
+
+void ProcessUnoMessages() {
+  if (!unoConnected) return;
+  while (unoSerial.available() > 0) {
+    String line = unoSerial.readStringUntil('\n');
+    line.trim();
+    if (line.length()==0) continue;
+    if (line.startsWith("播报") && line.length()>=6) {
+      const char* cs = line.c_str();
+      std::string text;
+      for (size_t i=6; i<line.length(); i++) text.push_back(cs[i]);
+      if (!text.empty()) g_text_queue.push_back(text);
+    } else if (line.startsWith("UNO:") && line.indexOf("READY")!=-1) {
+      g_display->ShowStatus("UNO已就绪");
+    }
+  }
+}
+
+// ================================================================
+// 马上命令处理
+// ================================================================
+void processMashangCommand(const std::string& content) {
+  size_t pos = content.find("马上");
+  if (pos==std::string::npos) return;
+  size_t verbStart = pos+6;
+  if (verbStart >= content.length()) return;
+  if (getChineseCharLength(content,verbStart) != 3) return;
+  std::string verb = content.substr(verbStart,3);
+  size_t c2s = verbStart+3;
+  if (c2s>=content.length() || getChineseCharLength(content,c2s)!=3) return;
+  verb += content.substr(c2s,3);
+  size_t nounStart = verbStart+6;
+  std::string noun;
+  if (nounStart < content.length()) {
+    noun = content.substr(nounStart);
+    const std::string puncts = "。，！？.?!;";
+    while (!noun.empty()) {
+      size_t ll = getChineseCharLength(noun, noun.length()-1);
+      if (puncts.find(noun.substr(noun.length()-ll))!=std::string::npos)
+        noun = noun.substr(0, noun.length()-ll);
+      else break;
+    }
+    noun.erase(std::remove_if(noun.begin(),noun.end(),::isspace),noun.end());
+  }
+  if (!unoConnected) { g_display->ShowStatus("UNO未连接"); return; }
+  unoSerial.print("CMD_START\n"); delay(10);
+  unoSerial.print(("VERB:"+verb+"\n").c_str()); delay(10);
+  unoSerial.print((noun.empty()?"NOUN:\n":("NOUN:"+noun+"\n")).c_str()); delay(10);
+  unoSerial.print("CMD_END\n"); delay(10);
+  g_display->ShowStatus(("发送:"+verb+(noun.empty()?"":" -> "+noun)).c_str());
+}
+
+// ================================================================
+// 相对时间提醒解析（不依赖NTP，中文+阿拉伯数字均支持）
+// ================================================================
+int ParseTimedReminders(const std::string& user_text) {
+  std::vector<std::string> segs;
+  {
+    const std::string sep1="，", sep2="、";
+    size_t start=0; bool found=true;
+    while (found) {
+      found=false;
+      size_t p1=user_text.find(sep1,start), p2=user_text.find(sep2,start);
+      size_t p=std::string::npos, sl=3;
+      if (p1!=std::string::npos&&(p2==std::string::npos||p1<=p2)){p=p1;sl=3;}
+      else if (p2!=std::string::npos){p=p2;sl=3;}
+      if (p!=std::string::npos){segs.push_back(user_text.substr(start,p-start));start=p+sl;found=true;}
+    }
+    if (start<user_text.length()) segs.push_back(user_text.substr(start));
+  }
+  if (segs.empty()) segs.push_back(user_text);
+
+  int count=0;
+  for (auto& seg : segs) {
+    seg = TrimPunctuation(seg);
+    if (seg.empty()) continue;
+    size_t hou = seg.find("后");
+    if (hou==std::string::npos) continue;
+    std::string time_part   = seg.substr(0, hou);
+    std::string action_part = TrimPunctuation(seg.substr(hou+3));
+    if (time_part.empty()||action_part.empty()) continue;
+    unsigned long ms = ParseTimeToMs(time_part);
+    if (ms==0) { printf("无法解析时间段: %s\n", time_part.c_str()); continue; }
+
+    TimedReminder tr;
+    tr.trigger_ms    = millis() + ms;
+    tr.trigger_epoch = 0;
+    tr.use_epoch     = false;
+    tr.reminder_text = "该" + action_part + "啦";
+    tr.fired         = false;
+    g_timed_reminders.push_back(tr);
+    printf("添加相对提醒: %s, %lu ms后\n", tr.reminder_text.c_str(), ms);
+    count++;
+  }
+  return count;
+}
+
+// ================================================================
+// 绝对时间提醒解析（需要NTP）
+// 支持：下午3点30分提醒喝水 / 13点50分提醒开会 / 晚上8点叫我休息
+// ================================================================
+int ParseAbsoluteReminders(const std::string& user_text) {
+  size_t dian_pos = user_text.find("点");
+  if (dian_pos==std::string::npos) return 0;
+
+  // 检查触发词
+  const std::vector<std::string> triggers = {"提醒","叫我","记得","通知"};
+  size_t trigger_pos=std::string::npos, trigger_len=0;
+  for (const auto& t : triggers) {
+    size_t p = user_text.find(t);
+    if (p!=std::string::npos){trigger_pos=p;trigger_len=t.length();break;}
+  }
+  if (trigger_pos==std::string::npos) return 0;
+
+  if (!g_ntp_synced) {
+    g_text_queue.push_back("时钟尚未同步，请稍等片刻再设置准点提醒");
+    return -1; // 已处理，阻止继续fallback
+  }
+
+  // 判断上午/下午
+  struct { const char* kw; bool pm; } periods[] = {
+    {"下午",true},{"晚上",true},{"傍晚",true},{"夜里",true},{"深夜",true},
+    {"上午",false},{"早上",false},{"早晨",false},{"凌晨",false},{nullptr,false}
+  };
+  bool force_pm=false, force_am=false;
+  for (int i=0; periods[i].kw; i++) {
+    size_t kp = user_text.find(periods[i].kw);
+    if (kp!=std::string::npos && kp<dian_pos) {
+      if (periods[i].pm) force_pm=true; else force_am=true; break;
+    }
+  }
+
+  // 提取小时
+  std::string hour_str = ScanBackNumberStr(user_text, dian_pos);
+  if (hour_str.empty()) return 0;
+  int hour = ParseChineseInt(hour_str);
+  if (hour<0||hour>23) return 0;
+  if (force_pm && hour<12) hour+=12;
+  if (force_am && hour==12) hour=0;
+
+  // 提取分钟
+  int minute=0;
+  size_t after_dian = dian_pos+3;
+  size_t fen_pos2 = user_text.find("分", after_dian);
+  if (fen_pos2!=std::string::npos && fen_pos2<trigger_pos) {
+    std::string ms2 = ScanBackNumberStr(user_text, fen_pos2);
+    if (!ms2.empty()) { int v=ParseChineseInt(ms2); if(v>=0&&v<=59) minute=v; }
+  } else {
+    // 尝试"点"到触发词之间的数字（如"3点30提醒"）
+    std::string seg = TrimPunctuation(user_text.substr(after_dian, trigger_pos-after_dian));
+    size_t pp=0; std::string digits;
+    while (pp<seg.length()) {
+      int cl=getUtf8CharLength((unsigned char)seg[pp]);
+      std::string ch=seg.substr(pp,cl);
+      bool is_num=(ch.size()==1&&ch[0]>='0'&&ch[0]<='9');
+      if (!is_num) {
+        static const char* CN[]={"零","一","二","三","四","五","六","七","八","九","两","十","百",nullptr};
+        for (int i=0;CN[i];i++) if(ch==CN[i]){is_num=true;break;}
+      }
+      if (is_num) digits+=ch; else break;
+      pp+=cl;
+    }
+    if (!digits.empty()) { int v=ParseChineseInt(digits); if(v>=0&&v<=59) minute=v; }
+  }
+
+  // 提取动作
+  std::string action = TrimPunctuation(user_text.substr(trigger_pos+trigger_len));
+  if (action.empty()) action = "处理事务";
+
+  // 构建触发时刻
+  struct tm now_tm;
+  if (!getLocalTime(&now_tm)) { printf("无法获取本地时间\n"); return 0; }
+  struct tm trigger_tm = now_tm;
+  trigger_tm.tm_hour = hour;
+  trigger_tm.tm_min  = minute;
+  trigger_tm.tm_sec  = 0;
+  time_t te = mktime(&trigger_tm);
+  time_t ne = time(nullptr);
+  if (te <= ne) {
+    te += 24*3600;
+    printf("时间已过，顺延到明天 %02d:%02d\n", hour, minute);
+  }
+
+  TimedReminder tr;
+  tr.trigger_epoch = te;
+  tr.trigger_ms    = 0;
+  tr.use_epoch     = true;
+  tr.reminder_text = "该" + action + "啦";
+  tr.fired         = false;
+  g_timed_reminders.push_back(tr);
+  printf("添加绝对时间提醒: %s, %02d:%02d\n", tr.reminder_text.c_str(), hour, minute);
+
+  char confirm[48];
+  snprintf(confirm, sizeof(confirm), "已设置%02d:%02d提醒", hour, minute);
+  g_display->ShowStatus(confirm);
+  g_text_queue.push_back(
+    std::string("好的，我会在") + std::to_string(hour) + "点" +
+    (minute>0 ? std::to_string(minute)+"分" : "") + "提醒你" + action);
+  return 1;
+}
+
+// ================================================================
+// 顺序任务解析
+// ================================================================
+bool ParseSequentialTask(const std::string& user_text) {
+  if (!ContainsCN(user_text, "先")) return false;
+  const std::vector<std::string> delimiters = {"先","后","再","然后"};
+  std::vector<std::string> steps;
+  size_t pos=0;
+  while (pos<user_text.length()) {
+    bool is_delim=false; size_t dl=0;
+    for (const auto& d:delimiters)
+      if (user_text.substr(pos,d.length())==d){is_delim=true;dl=d.length();break;}
+    if (is_delim) {
+      pos+=dl;
+      size_t ss=pos, nd=user_text.length();
+      for (const auto& d:delimiters){size_t np=user_text.find(d,pos);if(np!=std::string::npos&&np<nd)nd=np;}
+      std::string step=TrimPunctuation(user_text.substr(ss,nd-ss));
+      if (!step.empty()) steps.push_back(step);
+      pos=nd;
+    } else {
+      pos+=getUtf8CharLength((unsigned char)user_text[pos]);
+    }
+  }
+  if (steps.empty()) return false;
+
+  std::vector<std::string> messages;
+  for (const auto& step:steps) {
+    if (step.empty()) continue;
+    int vl=getUtf8CharLength((unsigned char)step[0]);
+    std::string vc=step.substr(0,vl), dev=TrimPunctuation(step.substr(vl));
+    std::string aw;
+    if (vc=="开") aw="打开";
+    else if (vc=="关") aw="关闭";
+    else if (step.length()>=6) {
+      int v2=getUtf8CharLength((unsigned char)step[vl]);
+      std::string vc2=step.substr(0,vl+v2);
+      dev=TrimPunctuation(step.substr(vl+v2));
+      if (vc2=="打开"||vc2=="开启") aw="打开";
+      else if (vc2=="关闭"||vc2=="关掉") aw="关闭";
+      else aw=vc2;
+    } else aw=vc;
+    if (!dev.empty()) messages.push_back(aw+dev);
+  }
+  if (messages.empty()) return false;
+
+  g_sequential_task.messages          = messages;
+  g_sequential_task.current_index     = 0;
+  g_sequential_task.next_send_time_ms = millis();
+  g_sequential_task.active            = true;
+  printf("顺序任务 %d 步\n", (int)messages.size());
+  return true;
+}
+
+// ================================================================
+// 统一任务解析入口
+// ================================================================
+bool TryParseAndCreateTask(const std::string& user_text) {
+  // 1. 顺序任务（先…后…再…）
+  if (ContainsCN(user_text, "先"))
+    if (ParseSequentialTask(user_text)) { g_display->ShowStatus("顺序任务已创建"); return true; }
+
+  // 2. 绝对时间提醒（含"点"且有触发词，优先级高于相对时间）
+  if (ContainsCN(user_text, "点")) {
+    int n = ParseAbsoluteReminders(user_text);
+    if (n != 0) return true; // n>0成功, n<0 NTP未同步已提示
+  }
+
+  // 3. 相对时间提醒（含"后"）
+  if (ContainsCN(user_text, "后")) {
+    int n = ParseTimedReminders(user_text);
+    if (n > 0) {
+      char buf[32]; snprintf(buf,sizeof(buf),"已设置%d个提醒",n);
+      g_display->ShowStatus(buf); return true;
+    }
+  }
+  return false;
+}
+
+// ================================================================
+// 定时提醒触发（millis + epoch 双模式）
+// ================================================================
+void ProcessTimedReminders() {
+  unsigned long now_ms    = millis();
+  time_t        now_epoch = g_ntp_synced ? time(nullptr) : 0;
+  bool any_fired = false;
+  for (auto& tr : g_timed_reminders) {
+    if (tr.fired) continue;
+    bool fire = tr.use_epoch ? (g_ntp_synced && now_epoch>=tr.trigger_epoch)
+                             : (now_ms >= tr.trigger_ms);
+    if (fire) {
+      tr.fired = true; any_fired = true;
+      printf("触发提醒: %s\n", tr.reminder_text.c_str());
+      g_text_queue.push_back(tr.reminder_text);
+      g_display->ShowStatus(tr.reminder_text.c_str());
+    }
+  }
+  if (any_fired)
+    g_timed_reminders.erase(
+      std::remove_if(g_timed_reminders.begin(), g_timed_reminders.end(),
+        [](const TimedReminder& r){ return r.fired; }),
+      g_timed_reminders.end());
+}
+
+// ================================================================
+// 顺序任务驱动
+// ================================================================
+void ProcessSequentialTask() {
+  if (!g_sequential_task.active) return;
+  unsigned long now = millis();
+  if (now < g_sequential_task.next_send_time_ms) return;
+  if (g_current_chat_state==ai_vox::ChatState::kSpeaking) {
+    g_sequential_task.next_send_time_ms = now+200; return;
+  }
+  if (g_sequential_task.current_index < g_sequential_task.messages.size()) {
+    g_text_queue.push_back(g_sequential_task.messages[g_sequential_task.current_index++]);
+    g_sequential_task.next_send_time_ms = now + kSequentialIntervalMs;
+  } else {
+    g_sequential_task.active = false;
+    g_display->ShowStatus("顺序任务完成");
+  }
+}
+
+// ================================================================
+// 显示初始化
+// ================================================================
+void InitDisplay() {
+  i2c_master_bus_handle_t bus;
+  i2c_master_bus_config_t bc = {
+    .i2c_port=I2C_NUM_0, .sda_io_num=kI2cPinSda, .scl_io_num=kI2cPinScl,
+    .clk_source=I2C_CLK_SRC_DEFAULT, .glitch_ignore_cnt=7,
+    .intr_priority=0, .trans_queue_depth=0,
+    .flags={.enable_internal_pullup=1, .allow_pd=false},
+  };
+  ESP_ERROR_CHECK(i2c_new_master_bus(&bc, &bus));
+  esp_lcd_panel_io_handle_t io=nullptr;
+  esp_lcd_panel_io_i2c_config_t ic = {
+    .dev_addr=0x3C, .on_color_trans_done=nullptr, .user_ctx=nullptr,
+    .control_phase_bytes=1, .dc_bit_offset=6, .lcd_cmd_bits=8, .lcd_param_bits=8,
+    .flags={.dc_low_on_data=0, .disable_control_phase=0}, .scl_speed_hz=400*1000,
+  };
+  ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c_v2(bus, &ic, &io));
+  esp_lcd_panel_handle_t panel=nullptr;
+  esp_lcd_panel_dev_config_t pc={};
+  pc.reset_gpio_num=-1; pc.bits_per_pixel=1;
+  esp_lcd_panel_ssd1306_config_t sc={.height=(uint8_t)kDisplayHeight};
+  pc.vendor_config=&sc;
+  ESP_ERROR_CHECK(esp_lcd_new_panel_ssd1306(io, &pc, &panel));
+  ESP_ERROR_CHECK(esp_lcd_panel_reset(panel));
+  ESP_ERROR_CHECK(esp_lcd_panel_init(panel));
+  ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel, true));
+  g_display = std::make_unique<Display>(io, panel, kDisplayWidth, kDisplayHeight,
+                                        kDisplayMirrorX, kDisplayMirrorY);
+  g_display->Start();
+}
+
+// ================================================================
+// 网络检测
+// ================================================================
+bool TestInternetConnection() {
+  IPAddress dns;
+  bool ok = WiFi.hostByName("8.8.8.8", dns);
+  printf("DNS: %s\n", ok?"pass":"fail");
+  return ok;
+}
+bool TestServerConnection() {
+  WiFiClient c;
+  bool ok = c.connect("api.tenclass.net", 80, 2000);
+  if (ok) c.stop();
+  printf("Server: %s\n", ok?"pass":"fail");
+  return ok;
+}
+
+// ================================================================
+// AI引擎启动
+// ================================================================
+bool StartAIEngine(std::shared_ptr<ai_vox::AudioInputDeviceI2sStd> dev) {
+  if (WiFi.status()!=WL_CONNECTED)  { g_display->ShowStatus("WiFi未连接");    return false; }
+  if (!TestInternetConnection())     { g_display->ShowStatus("网络连接失败");  return false; }
+  if (!TestServerConnection())       { g_display->ShowStatus("服务器连接失败"); return false; }
+  auto& engine = ai_vox::Engine::GetInstance();
+  g_display->ShowStatus("配置AI引擎");
+  engine.SetObserver(g_observer);
+  engine.SetOtaUrl("https://api.tenclass.net/xiaozhi/ota/");
+  engine.ConfigWebsocket("wss://api.tenclass.net/xiaozhi/v1/",
+    {{"Authorization","Bearer test-token"}});
+  g_display->ShowStatus("AI引擎启动中");
+  engine.Start(dev, g_audio_output_device);
+  delay(1000);
+  g_display->ShowStatus("AI引擎启动完成");
+  return true;
+}
+
+// ================================================================
+// WiFi配网
+// ================================================================
+void ProcessWiFiConfig() {
+  switch (g_wifi_config_state) {
+    case WiFiConfigState::IDLE:
+      if (digitalRead(kTriggerPin)==LOW) {
+        g_config_start_time = millis();
+        g_wifi_config_state = WiFiConfigState::CHECKING_BUTTON;
+        g_display->ShowStatus("请保持按下5秒");
+      }
+      break;
+    case WiFiConfigState::CHECKING_BUTTON:
+      if (digitalRead(kTriggerPin)==HIGH) {
+        g_wifi_config_state = WiFiConfigState::IDLE;
+        g_display->ShowStatus("配网取消"); return;
+      }
+      if (millis()-g_config_start_time > kConfigButtonPressTime) {
+        g_wifi_config_state = WiFiConfigState::CONFIG_PORTAL;
+        if (g_wifiManager) { delete g_wifiManager; g_wifiManager=nullptr; }
+        g_wifiManager = new WiFiManager();
+        g_wifiManager->setAPCallback([](WiFiManager*){ Serial.println("进入配网模式"); });
+        g_wifiManager->setConnectTimeout(0);
+        g_wifiManager->setConfigPortalTimeout(300);
+        g_wifiManager->setConfigPortalBlocking(false);
+        g_wifiManager->startConfigPortal("AI_燕归乐");
+        g_config_start_time = millis();
+      }
+      break;
+    case WiFiConfigState::CONFIG_PORTAL:
+      if (g_wifiManager) {
+        g_wifiManager->process();
+        if (WiFi.status()==WL_CONNECTED) {
+          g_wifi_config_state  = WiFiConfigState::CONNECTED;
+          delete g_wifiManager; g_wifiManager=nullptr;
+          g_ai_engine_started  = false;
+          g_engine_retry_count = 0;
+          g_ntp_init_done      = false;
+          g_display->ShowStatus("WiFi已连接"); return;
+        }
+        if (millis()-g_config_start_time > kConfigPortalTimeout) {
+          delete g_wifiManager; g_wifiManager=nullptr;
+          g_display->ShowStatus("配网超时，重启");
+          delay(2000); ESP.restart();
+        }
+      }
+      break;
+    default: break;
+  }
+}
+
+void StartWiFiConfig() {
+  pinMode(kTriggerPin, INPUT_PULLUP);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin();
+  unsigned long t = millis();
+  while (millis()-t < 10000) {
+    if (WiFi.status()==WL_CONNECTED) {
+      g_wifi_config_state = WiFiConfigState::CONNECTED;
+      g_display->ShowStatus("WiFi已连接"); return;
+    }
+    delay(500); Serial.print(".");
+  }
+  g_wifi_config_state = WiFiConfigState::IDLE;
+  g_display->ShowStatus("请长按按键5秒配网");
+}
+
+// ================================================================
+// 按键逻辑
+// ================================================================
+void HandleButtonLogic() {
+  static unsigned long last_check=0, press_start=0;
+  static bool pressed=false;
+  if (millis()-last_check < 50) return;
+  last_check = millis();
+  if (digitalRead(kTriggerPin)==LOW) {
+    if (!pressed) { pressed=true; press_start=millis(); }
+    else if (millis()-press_start > 5000) {
+      g_display->ShowStatus("重置WiFi...");
+      WiFiManager wm; wm.resetSettings();
+      WiFi.disconnect(true); delay(1000); ESP.restart();
+    }
+  } else {
+    if (pressed) {
+      unsigned long dur = millis()-press_start;
+      pressed = false;
+      if (dur>50 && dur<500 && g_ai_engine_started) {
+        ai_vox::Engine::GetInstance().Advance();
+        g_display->ShowStatus("触发聆听");
+      }
+    }
+  }
+}
+
+// ================================================================
+// MCP工具注册
+// ================================================================
+void InitMcpTools() {
+  auto& e = ai_vox::Engine::GetInstance();
+  e.AddMcpTool("self.audio_speaker.set_volume","Set the volume of the audio speaker.",
+    {{"volume", ai_vox::ParamSchema<int64_t>{.default_value=std::nullopt,.min=0,.max=100}}});
+  e.AddMcpTool("self.audio_speaker.get_volume","Get the volume of the audio speaker.",{});
+  e.AddMcpTool("self.led.set","Set the state of the LED, true for on, false for off.",
+    {{"state", ai_vox::ParamSchema<bool>{.default_value=std::nullopt}}});
+  e.AddMcpTool("self.led.get","Get the state of the LED, true for on, false for off.",{});
+}
+
+}  // namespace
+
+// ================================================================
+// setup()
+// ================================================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  printf("\n===== AI VOX Setup Start =====\n");
+  pinMode(kLedPin, OUTPUT);
+  digitalWrite(kLedPin, LOW);
+  InitDisplay();
+  g_display->ShowStatus("初始化中...");
+  StartWiFiConfig();
+  InitUnoCommunication();
+  InitMcpTools();
+  g_sequential_task.active        = false;
+  g_sequential_task.current_index = 0;
+  printf("===== AI VOX Setup Complete =====\n");
+}
+
+// ================================================================
+// loop() —— 核心策略：引擎始终在 聆听 ↔ 说话 循环，不进入休眠
+// ================================================================
+void loop() {
+  // ── 配网阶段 ──
+  if (g_wifi_config_state != WiFiConfigState::CONNECTED) {
+    ProcessWiFiConfig();
+    delay(kConfigCheckInterval);
+    return;
+  }
+
+  // ── WiFi连接成功后一次性NTP同步 ──
+  if (!g_ntp_init_done) {
+    g_ntp_init_done = true;
+    SyncNTP();
+  }
+
+  // ── 外设 ──
+  HandleButtonLogic();
+  ProcessUnoMessages();
+
+  // ── 定时任务 ──
+  ProcessTimedReminders();
+  ProcessSequentialTask();
+
+  // ── 文本队列 ──
+  if (!g_text_queue.empty()) ProcessTextQueue();
+
+  // ── AI引擎启动 / 重试 ──
+  if (!g_ai_engine_started) {
+    // 重试等待间隔
+    if (g_engine_start_time>0 && millis()-g_engine_start_time < kEngineRetryDelay) {
+      delay(10); return;
+    }
+#if AUDIO_INPUT_DEVICE_TYPE == AUDIO_INPUT_DEVICE_TYPE_I2S_STD
+    auto dev = std::make_shared<ai_vox::AudioInputDeviceI2sStd>(kMicPinSck, kMicPinWs, kMicPinSd);
+#else
+    auto dev = std::make_shared<ai_vox::PdmAudioInputDevice>(kMicPinSck, kMicPinSd);
+#endif
+    printf("启动AI引擎 (%d/%d)...\n", g_engine_retry_count+1, kMaxEngineRetries);
+    if (StartAIEngine(dev)) {
+      g_ai_engine_started  = true;
+      g_engine_retry_count = 0;
+      g_engine_start_time  = 0;
+      g_display->ShowStatus("系统准备就绪");
+    } else {
+      g_engine_retry_count++;
+      g_engine_start_time = millis();
+      if (g_engine_retry_count >= kMaxEngineRetries) {
+        g_display->ShowStatus("启动失败，重启中");
+        delay(3000); ESP.restart();
+      } else {
+        char buf[32]; snprintf(buf,sizeof(buf),"启动失败 %d/%d",g_engine_retry_count,kMaxEngineRetries);
+        g_display->ShowStatus(buf);
+      }
+    }
+  }
+
+  // ── AI引擎事件处理 ──
+  if (g_ai_engine_started) {
+    auto& engine = ai_vox::Engine::GetInstance();
+    for (auto& event : g_observer->PopEvents()) {
+
+      if (auto e = std::get_if<ai_vox::TextReceivedEvent>(&event)) {
+        if (IsHelloMessage(e->content)) ExtractSessionId(e->content);
+
+      } else if (auto e = std::get_if<ai_vox::ActivationEvent>(&event)) {
+        g_display->ShowStatus("激活设备");
+        g_display->SetChatMessage(e->message);
+
+      } else if (auto e = std::get_if<ai_vox::StateChangedEvent>(&event)) {
+        g_current_chat_state = e->new_state;
+        printf("状态 -> %d\n", (int)e->new_state);
+        switch (e->new_state) {
+
+          // ★★★ 核心：kIdle / kStandby / kInitted 全部自动推进，永不休眠 ★★★
+          case ai_vox::ChatState::kIdle:
+            g_display->ShowStatus("空闲，推进中");
+            engine.Advance();
+            break;
+          case ai_vox::ChatState::kStandby:
+            engine.Advance();
+            break;
+          case ai_vox::ChatState::kInitted:
+            g_display->ShowStatus("初始化完成");
+            engine.Advance();
+            break;
+
+          case ai_vox::ChatState::kLoading:
+            g_display->ShowStatus("加载协议中");
+            break;
+
+          // ★ 加载失败：不重启，标记重试，定时任务在内存中仍然保留
+          case ai_vox::ChatState::kLoadingFailed:
+            printf("协议加载失败，等待重试\n");
+            g_display->ShowStatus("协议失败，重试中");
+            g_ai_engine_started = false;
+            g_engine_start_time = millis(); // 触发重试计时
+            break;
+
+          case ai_vox::ChatState::kConnecting:
+            g_display->ShowStatus("连接中...");
+            break;
+          case ai_vox::ChatState::kListening:
+            g_display->ShowStatus("聆听中");
+            break;
+          case ai_vox::ChatState::kSpeaking:
+            g_display->ShowStatus("说话中");
+            break;
+          default: break;
+        }
+
+      } else if (auto e = std::get_if<ai_vox::EmotionEvent>(&event)) {
+        g_display->SetEmotion(e->emotion);
+
+      } else if (auto e = std::get_if<ai_vox::ChatMessageEvent>(&event)) {
+        if (e->role == ai_vox::ChatRole::kAssistant) {
+          g_display->SetChatMessage(e->content);
+          processMashangCommand(e->content);
+        } else {
+          // 用户语音识别结果：先尝试本地任务解析，否则交给AI
+          if (TryParseAndCreateTask(e->content))
+            g_display->SetChatMessage("用户: " + e->content);
+          else
+            g_display->SetChatMessage(e->content);
+        }
+
+      } else if (auto e = std::get_if<ai_vox::McpToolCallEvent>(&event)) {
+        if ("self.audio_speaker.set_volume" == e->name) {
+          const auto* v = e->param<int64_t>("volume");
+          if (v) { g_audio_output_device->set_volume(*v); engine.SendMcpCallResponse(e->id, true); }
+          else     engine.SendMcpCallError(e->id, "Missing valid argument: volume");
+        } else if ("self.audio_speaker.get_volume" == e->name) {
+          engine.SendMcpCallResponse(e->id, g_audio_output_device->volume());
+        } else if ("self.led.set" == e->name) {
+          const auto* s = e->param<bool>("state");
+          if (s) { digitalWrite(kLedPin, *s); engine.SendMcpCallResponse(e->id, true); }
+          else     engine.SendMcpCallError(e->id, "Missing valid argument: state");
+        } else if ("self.led.get" == e->name) {
+          engine.SendMcpCallResponse(e->id, digitalRead(kLedPin)==HIGH);
+        }
+      }
+    }
+  }
+
+  delay(10);
+}
