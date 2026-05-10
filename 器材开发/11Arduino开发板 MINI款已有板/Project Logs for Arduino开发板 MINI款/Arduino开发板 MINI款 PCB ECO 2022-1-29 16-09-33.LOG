@@ -1,0 +1,6 @@
+Change Component Footprint: Designator=CN6 Old Footprint=CN-2*3-2.54 New Footprint=sip2*3
+Change Component Footprint: Designator=CN3 Old Footprint=CN-JC2.0-4P New Footprint=sip4
+Change Component Footprint: Designator=CN4 Old Footprint=CN-JC2.0-4P New Footprint=sip4
+Change Component Footprint: Designator=CN5 Old Footprint=CN-JC2.0-4P New Footprint=sip4
+Change Component Footprint: Designator=CN2 Old Footprint=CN-JC2.0-6P New Footprint=sip6
+Change Component Footprint: Designator=CN1 Old Footprint=CN-JC2.0-8P New Footprint=sip8

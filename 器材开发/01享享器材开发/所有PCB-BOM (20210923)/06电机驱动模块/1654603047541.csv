@@ -1,0 +1,5 @@
+"Comment","Description","Designator","Footprint","LibRef","Pins","Quantity"
+"10NF","","C2,C3","0805_R","","2","2"
+"2.2UF","","C1","0805_R","","2","1"
+"47K","","R1","0805_R","","2","1"
+"DRV8833","DRV8833","U1","TSSOP-16","","16","1"

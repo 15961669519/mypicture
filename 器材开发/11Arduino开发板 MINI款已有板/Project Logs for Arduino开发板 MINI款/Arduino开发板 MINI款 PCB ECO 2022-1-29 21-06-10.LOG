@@ -1,0 +1,64 @@
+Change Component Comment : Designator=CN2 Old Comment=CN6 New Comment=排针6P
+Change Component Comment : Designator=CN1 Old Comment=CN8 New Comment=排针8P
+Change Component Comment : Designator=CN7 Old Comment=CN8 New Comment=排针8P
+Change Component Comment : Designator=CN8 Old Comment=CN10 New Comment=排针10P
+Added Component: Designator=CN9(SIP10)
+Add component. Clean all parameters for all variants
+Added Component: Designator=CN10(SIP6)
+Add component. Clean all parameters for all variants
+Added Component: Designator=CN11(sip8)
+Add component. Clean all parameters for all variants
+Added Component: Designator=CN12(SIP8)
+Add component. Clean all parameters for all variants
+Added Pin To Net: NetName=PB0 Pin=CN9-1
+Added Pin To Net: NetName=PB0 Pin=CN9-1
+Added Pin To Net: NetName=PB0 Pin=CN9-1
+Added Pin To Net: NetName=PB0 Pin=CN9-1
+Added Pin To Net: NetName=PB1 Pin=CN9-2
+Added Pin To Net: NetName=PB2 Pin=CN9-3
+Added Pin To Net: NetName=MOSI Pin=CN9-4
+Added Pin To Net: NetName=MISO Pin=CN9-5
+Added Pin To Net: NetName=PB5 Pin=CN9-6
+Added Pin To Net: NetName=GND Pin=CN9-7
+Added Pin To Net: NetName=AREF Pin=CN9-8
+Added Pin To Net: NetName=PC4 Pin=CN9-9
+Added Pin To Net: NetName=PC5 Pin=CN9-10
+Added Pin To Net: NetName=PC5 Pin=CN9-10
+Added Pin To Net: NetName=PC5 Pin=CN9-10
+Added Pin To Net: NetName=PC5 Pin=CN9-10
+Added Pin To Net: NetName=PC0 Pin=CN10-1
+Added Pin To Net: NetName=PC0 Pin=CN10-1
+Added Pin To Net: NetName=PC0 Pin=CN10-1
+Added Pin To Net: NetName=PC0 Pin=CN10-1
+Added Pin To Net: NetName=PC1 Pin=CN10-2
+Added Pin To Net: NetName=PC2 Pin=CN10-3
+Added Pin To Net: NetName=PC3 Pin=CN10-4
+Added Pin To Net: NetName=PC4 Pin=CN10-5
+Added Pin To Net: NetName=PC5 Pin=CN10-6
+Added Pin To Net: NetName=PC5 Pin=CN10-6
+Added Pin To Net: NetName=PC5 Pin=CN10-6
+Added Pin To Net: NetName=PC5 Pin=CN10-6
+Added Pin To Net: NetName=PD0 Pin=CN11-1
+Added Pin To Net: NetName=PD0 Pin=CN11-1
+Added Pin To Net: NetName=PD0 Pin=CN11-1
+Added Pin To Net: NetName=PD0 Pin=CN11-1
+Added Pin To Net: NetName=PD1 Pin=CN11-2
+Added Pin To Net: NetName=PD2 Pin=CN11-3
+Added Pin To Net: NetName=PD3 Pin=CN11-4
+Added Pin To Net: NetName=PD4 Pin=CN11-5
+Added Pin To Net: NetName=PD5 Pin=CN11-6
+Added Pin To Net: NetName=PD6 Pin=CN11-7
+Added Pin To Net: NetName=PD7 Pin=CN11-8
+Added Pin To Net: NetName=PD7 Pin=CN11-8
+Added Pin To Net: NetName=PD7 Pin=CN11-8
+Added Pin To Net: NetName=PD7 Pin=CN11-8
+Added Pin To Net: NetName=GND Pin=CN12-2
+Added Pin To Net: NetName=GND Pin=CN12-3
+Added Pin To Net: NetName=+5V Pin=CN12-4
+Added Pin To Net: NetName=+3V3 Pin=CN12-5
+Added Pin To Net: NetName=RESET Pin=CN12-6
+Added Pin To Net: NetName=+5V Pin=CN12-7
+Added Member To Class: ClassName=Arduino开发板 MINI款 Member=Component CN9 排母10P
+Added Member To Class: ClassName=Arduino开发板 MINI款 Member=Component CN10 排母6P
+Added Member To Class: ClassName=Arduino开发板 MINI款 Member=Component CN11 排母8P
+Added Member To Class: ClassName=Arduino开发板 MINI款 Member=Component CN12 排母8P

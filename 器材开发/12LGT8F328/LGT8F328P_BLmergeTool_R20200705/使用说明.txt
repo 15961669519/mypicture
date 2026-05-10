@@ -1,0 +1,19 @@
+experimental features. This version should NOT be used in production. 
+实验功能。此版本不应在生产中使用
+初版简单合并，未做文件检查和异常报错。
+合并后的程序文件请使用者自行测试验证，本程序不对使用后果负责。
+
+使用方法，把一下3个文件放入同一个文件夹目录，不要放其他多余文件。
+
+mergeBL4LGT8F328P_R0.1.exe
+optiboot_lgt8f328p.hex
+arduino应用的hex文件 注意文件名不能包含bootloader字符
+
+
+双击运行exe程序合并好的hex文件在merged文件夹里。
+
+欢迎反馈使用问题
+
+不建议使用此程序合并量产文件。
+
+量产文件请按照 LGT8F328P_合并arduino程序与bootloader固件的方法.pdf 自行人工合并。

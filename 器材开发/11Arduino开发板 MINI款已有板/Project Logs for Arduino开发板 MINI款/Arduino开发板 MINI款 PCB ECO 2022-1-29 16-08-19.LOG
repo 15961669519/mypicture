@@ -1,0 +1,5 @@
+Added Component: Designator=D1(DO-214AC(SMA)-M7限制使用-SMT)
+Add component. Clean all parameters for all variants
+Added Pin To Net: NetName=RESET Pin=D1-A
+Added Pin To Net: NetName=+5V Pin=D1-K
+Added Member To Class: ClassName=Arduino开发板 MINI款 Member=Component D1 1N4148

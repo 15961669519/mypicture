@@ -1,0 +1,2 @@
+Removed Pin From Net: NetName=RESET Pin=SW1-3
+Added Pin To Net: NetName=RESET Pin=SW1-4

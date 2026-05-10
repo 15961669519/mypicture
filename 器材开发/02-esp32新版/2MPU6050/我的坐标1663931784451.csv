@@ -1,0 +1,26 @@
+Altium Designer Pick and Place Locations
+G:\等级考试网课\器材开发\esp32新版\2MPU6050\Pick Place for MPU6050.csv
+
+========================================================================================================================
+File Design Information:
+
+Date:       23-09-22
+Time:       19:01
+Revision:   Not in VersionControl
+Variant:    No variations
+Units used: mil
+
+"Designator","Comment","Layer","Footprint","Center-X(mil)","Center-Y(mil)","Rotation","Description"
+"R26","NC","TopLayer","COMPONENT_6","292.851","822.000","180",""
+"R24","4K7","TopLayer","COMPONENT_6","228.851","822.000","180",""
+"R36","4K7","TopLayer","COMPONENT_6","655.851","818.000","180",""
+"R37","4K7","TopLayer","COMPONENT_6","656.851","759.000","180",""
+"C23","2.2nF","TopLayer","COMPONENT_4","656.851","701.000","180",""
+"C18","104","TopLayer","COMPONENT_5","271.851","698.000","90",""
+"C20","104","TopLayer","COMPONENT_5","401.851","934.000","0",""
+"C24","105","TopLayer","COMPONENT_5","703.851","942.000","270",""
+"C21","104","TopLayer","COMPONENT_5","487.851","937.000","180",""
+"C22","103","TopLayer","COMPONENT_5","562.851","934.000","180",""
+"Q5","662K","TopLayer","COMPONENT_3","793.851","770.000","180",""
+"U10","MPU-6050","TopLayer","COMPONENT_2","470.851","734.000","180",""
+"T3","弯针连接器KF2510-4P白色","TopLayer","21","484.647","490.725","90",""

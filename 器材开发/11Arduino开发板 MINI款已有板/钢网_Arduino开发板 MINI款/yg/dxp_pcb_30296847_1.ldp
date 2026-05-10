@@ -1,0 +1,3 @@
+Layer Pairs Export File for PCB: D:\TempSpace\GERBER\DXP_PCB_30296847_1.pcbdoc
+LayersSetName=Top_Bot_Thru_Holes|DrillFile=dxp_pcb_30296847_1-roundholes.txt|DrillLayers=gtl,gbl
+LayersSetName=Top_Bot_Slot_Holes|DrillFile=dxp_pcb_30296847_1-slotholes.txt|DrillLayers=gtl,gbl

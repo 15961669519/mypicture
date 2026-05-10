@@ -1,0 +1,26 @@
+Altium Designer Pick and Place Locations
+G:\等级考试网课\器材开发\esp32新版\3光电读码\Pick Place for 光电读码.csv
+
+========================================================================================================================
+File Design Information:
+
+Date:       23-09-22
+Time:       20:41
+Revision:   Not in VersionControl
+Variant:    No variations
+Units used: mil
+
+"Designator","Comment","Layer","Footprint","Center-X(mil)","Center-Y(mil)","Rotation","Description"
+"U5","LM358","TopLayer","COMPONENT_7","634.944","823.331","360",""
+"Q2","662K","TopLayer","COMPONENT_6","445.944","628.331","360",""
+"C9","105","TopLayer","COMPONENT_5","573.944","628.331","360",""
+"C5","104","TopLayer","COMPONENT_4","366.944","964.331","180",""
+"R4","100R","TopLayer","COMPONENT_3","725.944","975.331","360",""
+"R6","10K","TopLayer","COMPONENT_3","594.944","974.331","360",""
+"R8","10K","TopLayer","COMPONENT_3","364.944","899.331","360",""
+"R12","10K","TopLayer","COMPONENT_3","365.944","827.331","360",""
+"R14","10K","TopLayer","COMPONENT_3","365.944","759.331","360",""
+"R10","150R","TopLayer","COMPONENT_3","217.944","849.331","360",""
+"LED3","LED蓝","TopLayer","COMPONENT_2","218.944","782.331","360",""
+"JK2","ITR20403红外线对射式光电开关","TopLayer","COMPONENT_1","446.944","1124.331","360",""
+"T2","弯针连接器KF2510-3P白色","TopLayer","21","443.148","418.711","270",""

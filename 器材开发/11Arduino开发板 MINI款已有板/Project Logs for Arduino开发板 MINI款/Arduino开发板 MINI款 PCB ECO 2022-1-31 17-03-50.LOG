@@ -1,0 +1,9 @@
+Added Component: Designator=CN12(HDR2.54-M-LI-8P)
+Add component. Clean all parameters for all variants
+Added Pin To Net: NetName=GND Pin=CN12-2
+Added Pin To Net: NetName=GND Pin=CN12-3
+Added Pin To Net: NetName=+5V Pin=CN12-4
+Added Pin To Net: NetName=+3V3 Pin=CN12-5
+Added Pin To Net: NetName=RESET Pin=CN12-6
+Added Pin To Net: NetName=+5V Pin=CN12-7
+Added Member To Class: ClassName=Arduino¿ª·¢°å MINI¿î Member=Component CN12 ÅÅÄ¸8P

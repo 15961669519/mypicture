@@ -1,0 +1,14 @@
+Added Component: Designator=CN7(SIP8)
+Add component. Clean all parameters for all variants
+Added Pin To Net: NetName=GND Pin=CN7-2
+Added Pin To Net: NetName=GND Pin=CN7-3
+Added Pin To Net: NetName=+5V Pin=CN7-4
+Added Pin To Net: NetName=+3V3 Pin=CN7-5
+Added Pin To Net: NetName=RESET Pin=CN7-6
+Added Pin To Net: NetName=+5V Pin=CN7-7
+Added Pin To Net: NetName=VIN Pin=CN7-1
+Added Pin To Net: NetName=VIN Pin=CN7-1
+Added Pin To Net: NetName=VIN Pin=CN7-1
+Added Pin To Net: NetName=VIN Pin=CN7-1
+Added Net: Name=VIN
+Added Member To Class: ClassName=Arduino¿ª·¢°å MINI¿î Member=Component CN7 CN8

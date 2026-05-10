@@ -1,0 +1,5 @@
+MiniEVB(LGT8F328P);m328p;stk500;57600;
+Uno/Nano(ATmega328);m328p;stk500;115200;
+;m328p;stk500;1200;
+;m328p;stk500;1200;
+;m328p;stk500;1200;

@@ -1,0 +1,9 @@
+DRC Rules Export File for PCB: E:\ybc\813969W_Y31_02½»Í¨µÆ\1.PcbDoc
+RuleKind=ShortCircuit|RuleName=ShortCircuit|Scope=Board|Allowed=0
+RuleKind=Clearance|RuleName=Clearance|Scope=Board|Minimum=10.00
+RuleKind=Width|RuleName=Width|Scope=Board|Minimum=10.00
+RuleKind=SolderMaskExpansion|RuleName=SolderMaskExpansion|Scope=Board|Minimum=4.00
+RuleKind=Clearance|RuleName=CAM_Clearance_1|Scope=Board|Minimum=10.00
+RuleKind=Clearance|RuleName=CAM_Clearance_2|Scope=Board|Minimum=10.00
+RuleKind=Width|RuleName=CAM_Width_1|Scope=Board|Minimum=6.87
+RuleKind=Width|RuleName=CAM_Width_2|Scope=Board|Minimum=4.00

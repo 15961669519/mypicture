@@ -1,0 +1,13 @@
+Added Component: Designator=CN9(HDR2.54-M-LI-10P)
+Add component. Clean all parameters for all variants
+Added Pin To Net: NetName=PB0 Pin=CN9-1
+Added Pin To Net: NetName=PB1 Pin=CN9-2
+Added Pin To Net: NetName=PB2 Pin=CN9-3
+Added Pin To Net: NetName=MOSI Pin=CN9-4
+Added Pin To Net: NetName=MISO Pin=CN9-5
+Added Pin To Net: NetName=PB5 Pin=CN9-6
+Added Pin To Net: NetName=GND Pin=CN9-7
+Added Pin To Net: NetName=AREF Pin=CN9-8
+Added Pin To Net: NetName=PC4 Pin=CN9-9
+Added Pin To Net: NetName=PC5 Pin=CN9-10
+Added Member To Class: ClassName=Arduino¿ª·¢°å MINI¿î Member=Component CN9 ÅÅÄ¸10P

@@ -1,0 +1,3 @@
+Layer Pairs Export File for PCB: D:\外单PCB\201907\hqpy6156\i创学院\主板.PcbDoc
+LayersSetName=Top_Bot_Thru_Holes|DrillFile=主板-roundholes.txt|DrillLayers=gtl,gbl
+LayersSetName=Top_Bot_Slot_Holes|DrillFile=主板-slotholes.txt|DrillLayers=gtl,gbl

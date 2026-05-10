@@ -1,0 +1,12 @@
+Output: NC Drill Files
+Type  : NC Drill
+From  : Project [i创学院.PrjPcb]
+   Generated File[语音模块.TXT]
+   Generated File[语音模块.LDP]
+   Generated File[语音模块.DRR]
+
+
+Files Generated   : 3
+Documents Printed : 0
+
+Finished Output Generation At 11:59:31 On 2019/8/27

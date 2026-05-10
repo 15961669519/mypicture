@@ -1,0 +1,148 @@
+#include <Ps3Controller.h>   //安装PS3库
+
+const int leftMotor1_A = 17;
+const int leftMotor1_B = 18;
+const int leftMotor2_A = 33;
+const int leftMotor2_B = 25;
+const int rightMotor1_A = 16;
+const int rightMotor1_B = 4;
+const int rightMotor2_A = 26;
+const int rightMotor2_B = 27;
+
+#define MAX_MOTOR_SPEED 255
+
+const int PWMFreq = 5000; /* 1 KHz */
+const int PWMResolution = 8;
+const int PWMLeftSpeedChannelA = 1;
+const int PWMLeftSpeedChannelB = 2;
+const int PWMRightSpeedChannelA = 3;
+const int PWMRightSpeedChannelB = 4;
+
+
+void pinMode_setup()
+{
+  pinMode(leftMotor1_A,OUTPUT);
+  pinMode(leftMotor1_B,OUTPUT);
+  pinMode(leftMotor2_A,OUTPUT);
+  pinMode(leftMotor2_B,OUTPUT);
+  
+  pinMode(rightMotor1_A,OUTPUT);
+  pinMode(rightMotor1_B,OUTPUT);
+  pinMode(rightMotor2_A,OUTPUT);
+  pinMode(rightMotor2_B,OUTPUT);
+}
+
+void pwm_setup()
+{
+  ledcSetup(PWMLeftSpeedChannelA, PWMFreq, PWMResolution);
+  ledcSetup(PWMLeftSpeedChannelB, PWMFreq, PWMResolution);
+  ledcSetup(PWMRightSpeedChannelA, PWMFreq, PWMResolution);
+  ledcSetup(PWMRightSpeedChannelB, PWMFreq, PWMResolution);
+
+  ledcAttachPin(leftMotor1_A, PWMLeftSpeedChannelA);
+  ledcAttachPin(leftMotor2_A, PWMLeftSpeedChannelA);  
+
+  ledcAttachPin(leftMotor1_B, PWMLeftSpeedChannelB);
+  ledcAttachPin(leftMotor2_B, PWMLeftSpeedChannelB);  
+
+  ledcAttachPin(rightMotor1_A, PWMRightSpeedChannelA);
+  ledcAttachPin(rightMotor2_A, PWMRightSpeedChannelA);  
+
+  ledcAttachPin(rightMotor1_B, PWMRightSpeedChannelB);
+  ledcAttachPin(rightMotor2_B, PWMRightSpeedChannelB);  
+}
+
+void car_forward()
+{
+  ledcWrite(PWMLeftSpeedChannelA, MAX_MOTOR_SPEED);
+  ledcWrite(PWMLeftSpeedChannelB, 0);
+  ledcWrite(PWMRightSpeedChannelA, MAX_MOTOR_SPEED);
+  ledcWrite(PWMRightSpeedChannelB, 0); 
+}
+
+void car_reverse()
+{
+  ledcWrite(PWMLeftSpeedChannelA, 0);
+  ledcWrite(PWMLeftSpeedChannelB, MAX_MOTOR_SPEED);
+  ledcWrite(PWMRightSpeedChannelA, 0);
+  ledcWrite(PWMRightSpeedChannelB, MAX_MOTOR_SPEED); 
+}
+
+void car_turnLeft()
+{
+  ledcWrite(PWMLeftSpeedChannelA, 0);
+  ledcWrite(PWMLeftSpeedChannelB, MAX_MOTOR_SPEED);
+  ledcWrite(PWMRightSpeedChannelA, MAX_MOTOR_SPEED);
+  ledcWrite(PWMRightSpeedChannelB, 0); 
+}
+
+void car_turnRight()
+{
+  ledcWrite(PWMLeftSpeedChannelA, MAX_MOTOR_SPEED);
+  ledcWrite(PWMLeftSpeedChannelB, 0);
+  ledcWrite(PWMRightSpeedChannelA, 0);
+  ledcWrite(PWMRightSpeedChannelB, MAX_MOTOR_SPEED); 
+}
+
+void car_brake()
+{
+  ledcWrite(PWMLeftSpeedChannelA, 0);
+  ledcWrite(PWMLeftSpeedChannelB, 0);
+  ledcWrite(PWMRightSpeedChannelA, 0);
+  ledcWrite(PWMRightSpeedChannelB, 0); 
+}
+
+
+void notify()
+{
+  int yAxisValue =(Ps3.data.analog.stick.ly);  ////左摇杆-y轴-前/后车运
+  int xAxisValue =(Ps3.data.analog.stick.rx);  //右摇杆-x轴-左/右小车
+
+  if (yAxisValue <= -50)       //向前移动汽车
+  {
+    car_reverse();
+  }
+  else if (yAxisValue >= 50)   //将汽车向后移动
+  {
+    car_forward();
+  }
+  else if (xAxisValue >= 50)  //右边
+  {
+    car_turnLeft();
+  }
+  else if (xAxisValue <= -50)   //左边
+  {
+    car_turnRight();
+  }
+  else                          //
+  {
+    car_brake();
+  } 
+}
+
+void onConnect()
+{
+  Serial.println("Connected!.");
+}
+
+void onDisConnect()
+{
+  car_brake();
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode_setup();
+  pwm_setup();
+  
+  Ps3.attach(notify);
+  Ps3.attachOnConnect(onConnect);
+  Ps3.attachOnDisconnect(onDisConnect);
+  Ps3.begin();
+
+  Serial.println("Ready.");
+}
+
+void loop() {
+  // car_forward();
+}
